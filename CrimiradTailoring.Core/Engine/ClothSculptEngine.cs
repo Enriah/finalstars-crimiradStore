@@ -80,6 +80,7 @@ namespace CrimiradTailoring.Core.Engine
             EnsureConsistentNormals(mesh);
             mesh.RestVertices = new List<Vec3>(mesh.Vertices);
             cloth.Mesh = mesh;
+            RebuildDisplayMesh(cloth);
             return cloth;
         }
 
@@ -283,6 +284,9 @@ namespace CrimiradTailoring.Core.Engine
                 }
                 newExtractedCloth.Mesh.RestVertices.Clear();
                 newExtractedCloth.Mesh.EnsureRestVerticesInitialized();
+                newExtractedCloth.SubdivisionLevel = sourceCloth.SubdivisionLevel;
+                newExtractedCloth.EqualizeGridOnBend = sourceCloth.EqualizeGridOnBend;
+                RebuildDisplayMesh(newExtractedCloth);
             }
 
             sourceCloth.Mesh = remainingMesh;
@@ -293,6 +297,63 @@ namespace CrimiradTailoring.Core.Engine
             sourceCloth.SelectedTriangles.Clear();
             sourceCloth.SelectedVertices.Clear();
             sourceCloth.ActiveRegion = null;
+            sourceCloth.CachedBorders = null;
+            RebuildDisplayMesh(sourceCloth);
+            return true;
+        }
+
+        /// <summary>
+        /// Xóa dải ô tứ giác dọc theo cạnh biên MeshEdge được chọn (vẫn giữ lưới tứ giác sạch).
+        /// </summary>
+        public static bool DeleteBorderEdgeStrip(ClothEntity cloth, ClothBorderEdge border)
+        {
+            var chain = border.VertexIndices;
+            if (chain.Count < 2 || cloth.Mesh.Faces.Count <= 1) return false;
+
+            var borderEdgeKeys = new HashSet<long>(chain.Count);
+            int segCount = border.IsClosedLoop ? chain.Count : (chain.Count - 1);
+            for (int s = 0; s < segCount; s++)
+            {
+                int a = chain[s];
+                int b = chain[(s + 1) % chain.Count];
+                borderEdgeKeys.Add(((long)Math.Min(a, b) << 32) | (uint)Math.Max(a, b));
+            }
+
+            var facesToRemove = new HashSet<int>();
+            for (int f = 0; f < cloth.Mesh.Faces.Count; f++)
+            {
+                var face = cloth.Mesh.Faces[f];
+                for (int k = 0; k < face.Count; k++)
+                {
+                    int a = face[k];
+                    int b = face[(k + 1) % face.Count];
+                    long key = ((long)Math.Min(a, b) << 32) | (uint)Math.Max(a, b);
+                    if (borderEdgeKeys.Contains(key))
+                    {
+                        facesToRemove.Add(f);
+                        break;
+                    }
+                }
+            }
+
+            if (facesToRemove.Count == 0 || facesToRemove.Count >= cloth.Mesh.Faces.Count)
+                return false;
+
+            MeshData remainingMesh = BuildSubMeshFromFaces(
+                cloth.Mesh,
+                facesToRemove,
+                keepSelected: false,
+                out Dictionary<int, int> remainVertMap);
+
+            cloth.Mesh = remainingMesh;
+            cloth.Mesh.EnsureRestVerticesInitialized();
+            UpdateControlPointsAfterCut(cloth, remainVertMap);
+            cloth.SelectedFaces.Clear();
+            cloth.SelectedTriangles.Clear();
+            cloth.SelectedVertices.Clear();
+            cloth.ActiveRegion = null;
+            cloth.CachedBorders = null;
+            RebuildDisplayMesh(cloth);
             return true;
         }
 
@@ -1228,75 +1289,647 @@ namespace CrimiradTailoring.Core.Engine
             return pt.Position;
         }
 
+        private static float EvaluateSymmetricAxialT(float t, float bending01)
+        {
+            float clampedT = Clamp01(t);
+            float smooth = 0.5f * (1f - (float)Math.Cos(clampedT * Math.PI));
+            float blend = Clamp01(bending01 * 2f);
+            return clampedT + (smooth - clampedT) * blend;
+        }
+
+        private static Vec3 AddOmegaPleatLateralSwell(
+            Vec3 ctrlDisp,
+            Vec3 radialVec,
+            float radialDist,
+            float normalizedS,
+            float radius,
+            float bending,
+            float w)
+        {
+            if (bending <= 0.55f || radialDist <= 1e-5f || normalizedS <= 1e-4f || normalizedS >= 0.9999f)
+                return ctrlDisp;
+
+            float dispLen = ctrlDisp.Length;
+            if (dispLen <= 1e-4f)
+                return ctrlDisp;
+
+            Vec3 radDir = radialVec / radialDist;
+            Vec3 dispDir = ctrlDisp / dispLen;
+            Vec3 tangentOut = radDir - dispDir * Vec3.Dot(radDir, dispDir);
+            float tLen = tangentOut.Length;
+            if (tLen <= 1e-3f)
+                return ctrlDisp;
+
+            tangentOut = tangentOut / tLen;
+            float omegaBase = (bending - 0.55f) / 0.45f;
+            float omegaStrength = omegaBase * omegaBase;
+            float amp = omegaStrength * 0.33f * Math.Min(dispLen * 1.30f, radius);
+            float wave = (float)Math.Sin(2.0 * Math.PI * normalizedS);
+            float scale = (amp * wave) / Math.Max(0.45f, w);
+            return ctrlDisp + tangentOut * scale;
+        }
+
+        private static void CollectActiveControls(
+            ClothEntity cloth,
+            MeshData mesh,
+            out List<(ControlEdge edge, Vec3 aRest, Vec3 bRest, Vec3 dispA, Vec3 dispB, bool sameDelta)> activeEdges,
+            out List<(ControlPoint pt, Vec3 ptRest, Vec3 disp)> activePoints,
+            out HashSet<Guid> pointsOnActiveEdges)
+        {
+            activeEdges = new List<(ControlEdge edge, Vec3 aRest, Vec3 bRest, Vec3 dispA, Vec3 dispB, bool sameDelta)>();
+            activePoints = new List<(ControlPoint pt, Vec3 ptRest, Vec3 disp)>();
+            pointsOnActiveEdges = new HashSet<Guid>();
+            var pointsOnAnyEdge = new HashSet<Guid>();
+
+            foreach (var edge in cloth.Edges)
+            {
+                var pA = cloth.FindPoint(edge.PointAId);
+                var pB = cloth.FindPoint(edge.PointBId);
+                if (pA == null || pB == null) continue;
+
+                pointsOnAnyEdge.Add(pA.Id);
+                pointsOnAnyEdge.Add(pB.Id);
+
+                Vec3 aRest = GetPointRestPosition(mesh, pA);
+                Vec3 bRest = GetPointRestPosition(mesh, pB);
+                Vec3 dispA = pA.Position - aRest;
+                Vec3 dispB = pB.Position - bRest;
+
+                bool isActive = edge.IsEdited || pA.IsEdited || pB.IsEdited ||
+                                dispA.LengthSquared > 1e-8f || dispB.LengthSquared > 1e-8f;
+                if (!isActive) continue;
+
+                pointsOnActiveEdges.Add(pA.Id);
+                pointsOnActiveEdges.Add(pB.Id);
+                activeEdges.Add((edge, aRest, bRest, dispA, dispB, (dispA - dispB).LengthSquared < 1e-10f));
+            }
+
+            foreach (var pt in cloth.Points)
+            {
+                if (pointsOnAnyEdge.Contains(pt.Id)) continue;
+                Vec3 ptRest = GetPointRestPosition(mesh, pt);
+                Vec3 disp = pt.Position - ptRest;
+                if (!pt.IsEdited && disp.LengthSquared <= 1e-8f) continue;
+                activePoints.Add((pt, ptRest, disp));
+            }
+        }
+
+        private static void ApplyControlsToVertices(
+            IReadOnlyList<Vec3> restVerts,
+            List<Vec3> verts,
+            IReadOnlyList<(ControlEdge edge, Vec3 aRest, Vec3 bRest, Vec3 dispA, Vec3 dispB, bool sameDelta)> activeEdges,
+            IReadOnlyList<(ControlPoint pt, Vec3 ptRest, Vec3 disp)> activePoints,
+            ref float[]? peakWeights)
+        {
+            int count = restVerts.Count;
+            if (peakWeights == null || peakWeights.Length != count)
+                peakWeights = new float[count];
+            else
+                Array.Clear(peakWeights, 0, count);
+
+            while (verts.Count < count) verts.Add(Vec3.Zero);
+            for (int i = 0; i < count; i++)
+                verts[i] = restVerts[i];
+
+            if (activeEdges.Count == 0 && activePoints.Count == 0)
+                return;
+
+            for (int i = 0; i < count; i++)
+            {
+                Vec3 pRest = restVerts[i];
+                float prodOneMinusW = 1f;
+                float sumAlpha = 0f;
+                Vec3 weightedDisp = Vec3.Zero;
+
+                for (int eIdx = 0; eIdx < activeEdges.Count; eIdx++)
+                {
+                    var item = activeEdges[eIdx];
+                    float radius = Math.Max(0.01f, item.edge.Radius);
+                    float bending = Clamp01(item.edge.Bending);
+
+                    Vec3 closest = ClosestPointOnSegment3D(pRest, item.aRest, item.bRest, out float t);
+                    Vec3 radialVec = pRest - closest;
+                    float d = radialVec.Length;
+                    if (d > radius) continue;
+
+                    float s = d / radius;
+                    float w = EvaluateBendingWeight(s, bending);
+                    if (w <= 1e-5f) continue;
+
+                    float smoothT = item.sameDelta ? t : EvaluateSymmetricAxialT(t, bending);
+                    Vec3 ctrlDisp = Vec3.Lerp(item.dispA, item.dispB, smoothT);
+                    ctrlDisp = AddOmegaPleatLateralSwell(ctrlDisp, radialVec, d, s, radius, bending, w);
+
+                    float wClamped = w > 1f ? 1f : w;
+                    prodOneMinusW *= (1f - wClamped);
+                    float alpha = (wClamped * wClamped) / Math.Max(0.004f, 1f - 0.996f * wClamped);
+                    sumAlpha += alpha;
+                    weightedDisp = weightedDisp + ctrlDisp * alpha;
+                }
+
+                for (int pIdx = 0; pIdx < activePoints.Count; pIdx++)
+                {
+                    var item = activePoints[pIdx];
+                    float radius = Math.Max(0.01f, item.pt.Radius);
+                    float bending = Clamp01(item.pt.Bending);
+
+                    Vec3 radialVec = pRest - item.ptRest;
+                    float d = radialVec.Length;
+                    if (d > radius) continue;
+
+                    float s = d / radius;
+                    float w = EvaluateBendingWeight(s, bending);
+                    if (w <= 1e-5f) continue;
+
+                    Vec3 ctrlDisp = AddOmegaPleatLateralSwell(item.disp, radialVec, d, s, radius, bending, w);
+
+                    float wClamped = w > 1f ? 1f : w;
+                    prodOneMinusW *= (1f - wClamped);
+                    float alpha = (wClamped * wClamped) / Math.Max(0.004f, 1f - 0.996f * wClamped);
+                    sumAlpha += alpha;
+                    weightedDisp = weightedDisp + ctrlDisp * alpha;
+                }
+
+                if (sumAlpha > 1e-7f)
+                {
+                    float combinedWeight = 1f - prodOneMinusW;
+                    peakWeights[i] = combinedWeight;
+                    verts[i] = pRest + (weightedDisp / sumAlpha) * combinedWeight;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Chia mịn một cấp Catmull-Clark toàn tứ giác (mỗi ô -> 4 ô tứ giác), giữ sắc góc biên (>= 32°) và làm mượt C² cạnh cong & bề mặt.
+        /// </summary>
+        private static MeshData SubdivideCatmullClarkOnce(MeshData src, bool preserveParentMapping)
+        {
+            src.EnsureRestVerticesInitialized();
+            int vCount = src.RestVertices.Count;
+            var srcFaces = new List<List<int>>();
+            if (src.Faces.Count > 0)
+            {
+                srcFaces.AddRange(src.Faces);
+            }
+            else
+            {
+                for (int t = 0; t + 2 < src.Triangles.Count; t += 3)
+                    srcFaces.Add(new List<int> { src.Triangles[t], src.Triangles[t + 1], src.Triangles[t + 2] });
+            }
+
+            int fCount = srcFaces.Count;
+            var dst = new MeshData { Name = src.Name };
+            if (vCount < 3 || fCount == 0) return dst;
+
+            // 1. Face Points
+            var facePos = new Vec3[fCount];
+            var faceUv = new Vec2[fCount];
+            var vertAdjFaces = new List<int>[vCount];
+            for (int i = 0; i < vCount; i++) vertAdjFaces[i] = new List<int>(4);
+
+            var edgeMap = new Dictionary<long, int>(fCount * 2);
+            var edges = new List<(int a, int b, List<int> adjFaces)>(fCount * 2);
+            var vertEdges = new List<int>[vCount];
+            for (int i = 0; i < vCount; i++) vertEdges[i] = new List<int>(4);
+
+            for (int f = 0; f < fCount; f++)
+            {
+                var poly = srcFaces[f];
+                Vec3 sumP = Vec3.Zero;
+                Vec2 sumUv = Vec2.Zero;
+                for (int k = 0; k < poly.Count; k++)
+                {
+                    int vi = poly[k];
+                    sumP = sumP + src.RestVertices[vi];
+                    sumUv = sumUv + (vi < src.UVs.Count ? src.UVs[vi] : new Vec2(0.5f, 0.5f));
+                    vertAdjFaces[vi].Add(f);
+
+                    int vj = poly[(k + 1) % poly.Count];
+                    long key = vi < vj ? (((long)vi << 32) | (uint)vj) : (((long)vj << 32) | (uint)vi);
+                    if (!edgeMap.TryGetValue(key, out int eIdx))
+                    {
+                        eIdx = edges.Count;
+                        edgeMap[key] = eIdx;
+                        edges.Add((Math.Min(vi, vj), Math.Max(vi, vj), new List<int>(2)));
+                        vertEdges[vi].Add(eIdx);
+                        vertEdges[vj].Add(eIdx);
+                    }
+                    edges[eIdx].adjFaces.Add(f);
+                }
+                facePos[f] = sumP / poly.Count;
+                faceUv[f] = sumUv * (1f / poly.Count);
+            }
+
+            // 2. Edge Points
+            int eCount = edges.Count;
+            var edgePos = new Vec3[eCount];
+            var edgeUv = new Vec2[eCount];
+            for (int e = 0; e < eCount; e++)
+            {
+                var (va, vb, adjF) = edges[e];
+                Vec3 pA = src.RestVertices[va];
+                Vec3 pB = src.RestVertices[vb];
+                Vec2 uvA = va < src.UVs.Count ? src.UVs[va] : new Vec2(0.5f, 0.5f);
+                Vec2 uvB = vb < src.UVs.Count ? src.UVs[vb] : new Vec2(0.5f, 0.5f);
+
+                if (adjF.Count == 2)
+                {
+                    edgePos[e] = (pA + pB + facePos[adjF[0]] + facePos[adjF[1]]) * 0.25f;
+                    edgeUv[e] = (uvA + uvB + faceUv[adjF[0]] + faceUv[adjF[1]]) * 0.25f;
+                }
+                else
+                {
+                    edgePos[e] = (pA + pB) * 0.5f;
+                    edgeUv[e] = (uvA + uvB) * 0.5f;
+                }
+            }
+
+            // 3. New Vertex Points (ghim cố định các góc biên sắc nhọn, uốn C² cạnh mượt & mặt trong)
+            var newVertPos = new Vec3[vCount];
+            var newVertUv = new Vec2[vCount];
+            var boundaryNbs = new List<int>(4);
+            for (int v = 0; v < vCount; v++)
+            {
+                Vec3 oldP = src.RestVertices[v];
+                newVertUv[v] = v < src.UVs.Count ? src.UVs[v] : new Vec2(0.5f, 0.5f);
+
+                boundaryNbs.Clear();
+                foreach (int eIdx in vertEdges[v])
+                {
+                    var ed = edges[eIdx];
+                    if (ed.adjFaces.Count == 1)
+                        boundaryNbs.Add(ed.a == v ? ed.b : ed.a);
+                }
+
+                if (boundaryNbs.Count > 0)
+                {
+                    if (boundaryNbs.Count == 2)
+                    {
+                        Vec3 p0 = src.RestVertices[boundaryNbs[0]];
+                        Vec3 p1 = src.RestVertices[boundaryNbs[1]];
+                        Vec3 dIn = (oldP - p0).Normalized;
+                        Vec3 dOut = (p1 - oldP).Normalized;
+                        // Nếu đỉnh gập góc >= 32° (cos <= 0.848) -> ghim giữ nguyên góc nhọn của mảnh vải
+                        newVertPos[v] = Vec3.Dot(dIn, dOut) < 0.848f
+                            ? oldP
+                            : oldP * 0.75f + (p0 + p1) * 0.125f;
+                    }
+                    else
+                    {
+                        newVertPos[v] = oldP;
+                    }
+                    continue;
+                }
+
+                int valence = vertAdjFaces[v].Count;
+                if (valence < 3)
+                {
+                    newVertPos[v] = oldP;
+                    continue;
+                }
+
+                Vec3 fAvg = Vec3.Zero;
+                foreach (int fi in vertAdjFaces[v]) fAvg = fAvg + facePos[fi];
+                fAvg = fAvg / valence;
+
+                Vec3 rAvg = Vec3.Zero;
+                foreach (int eIdx in vertEdges[v])
+                {
+                    var ed = edges[eIdx];
+                    rAvg = rAvg + (src.RestVertices[ed.a] + src.RestVertices[ed.b]) * 0.5f;
+                }
+                rAvg = rAvg / Math.Max(1, vertEdges[v].Count);
+
+                newVertPos[v] = (fAvg + rAvg * 2f + oldP * (valence - 3)) / valence;
+            }
+
+            // 4. Đóng gói danh sách đỉnh + mặt tứ giác chuẩn
+            int totalVerts = vCount + eCount + fCount;
+            dst.RestVertices = new List<Vec3>(totalVerts);
+            dst.UVs = new List<Vec2>(totalVerts);
+            for (int i = 0; i < vCount; i++) { dst.RestVertices.Add(newVertPos[i]); dst.UVs.Add(newVertUv[i]); }
+            for (int e = 0; e < eCount; e++) { dst.RestVertices.Add(edgePos[e]); dst.UVs.Add(edgeUv[e]); }
+            for (int f = 0; f < fCount; f++) { dst.RestVertices.Add(facePos[f]); dst.UVs.Add(faceUv[f]); }
+            dst.Vertices = new List<Vec3>(dst.RestVertices);
+
+            var parentMapList = new List<int>(fCount * 4);
+            for (int f = 0; f < fCount; f++)
+            {
+                var poly = srcFaces[f];
+                int facePtIdx = vCount + eCount + f;
+                int parentF = (preserveParentMapping && src.SubdivParentFaces != null && f < src.SubdivParentFaces.Length)
+                    ? src.SubdivParentFaces[f]
+                    : f;
+
+                for (int k = 0; k < poly.Count; k++)
+                {
+                    int vPrev = poly[(k - 1 + poly.Count) % poly.Count];
+                    int vCurr = poly[k];
+                    int vNext = poly[(k + 1) % poly.Count];
+
+                    long kNext = vCurr < vNext ? (((long)vCurr << 32) | (uint)vNext) : (((long)vNext << 32) | (uint)vCurr);
+                    long kPrev = vPrev < vCurr ? (((long)vPrev << 32) | (uint)vCurr) : (((long)vCurr << 32) | (uint)vPrev);
+                    int eNextIdx = vCount + edgeMap[kNext];
+                    int ePrevIdx = vCount + edgeMap[kPrev];
+
+                    dst.Faces.Add(new List<int> { vCurr, eNextIdx, facePtIdx, ePrevIdx });
+                    parentMapList.Add(parentF);
+                }
+            }
+
+            dst.SubdivParentFaces = parentMapList.ToArray();
+            dst.RebuildTrianglesFromFaces();
+            return dst;
+        }
+
+        private static float ComputeRestChecksum(IReadOnlyList<Vec3> verts)
+        {
+            float sum = verts.Count * 1.13f;
+            int step = Math.Max(1, verts.Count / 48);
+            for (int i = 0; i < verts.Count; i += step)
+            {
+                Vec3 v = verts[i];
+                sum += v.X * (i + 1) * 0.17f + v.Y * (i + 3) * 0.31f + v.Z * (i + 7) * 0.43f;
+            }
+            if (verts.Count > 0)
+            {
+                Vec3 last = verts[verts.Count - 1];
+                sum += last.X * 1.7f + last.Y * 2.3f + last.Z * 3.1f;
+            }
+            return sum;
+        }
+
+        private static void BuildStaticTopologyData(MeshData mesh, out int[][] flatAdj, out bool[] isBoundary)
+        {
+            int n = mesh.Vertices.Count;
+            var adjLists = BuildVertexAdjacency(mesh);
+            flatAdj = new int[n][];
+            for (int i = 0; i < n; i++)
+                flatAdj[i] = adjLists[i].ToArray();
+
+            isBoundary = new bool[n];
+            var edgeCounts = new Dictionary<long, int>(n * 2);
+            void Tally(int a, int b)
+            {
+                long k = a < b ? (((long)a << 32) | (uint)b) : (((long)b << 32) | (uint)a);
+                edgeCounts.TryGetValue(k, out int c);
+                edgeCounts[k] = c + 1;
+            }
+            if (mesh.Faces.Count > 0)
+            {
+                foreach (var f in mesh.Faces)
+                    for (int k = 0; k < f.Count; k++) Tally(f[k], f[(k + 1) % f.Count]);
+            }
+            else
+            {
+                for (int t = 0; t + 2 < mesh.Triangles.Count; t += 3)
+                {
+                    Tally(mesh.Triangles[t], mesh.Triangles[t + 1]);
+                    Tally(mesh.Triangles[t + 1], mesh.Triangles[t + 2]);
+                    Tally(mesh.Triangles[t + 2], mesh.Triangles[t]);
+                }
+            }
+            foreach (var kv in edgeCounts)
+            {
+                if (kv.Value == 1)
+                {
+                    int a = (int)(kv.Key >> 32);
+                    int b = (int)(uint)kv.Key;
+                    if (a >= 0 && a < n) isBoundary[a] = true;
+                    if (b >= 0 && b < n) isBoundary[b] = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Dàn đều ô lưới dọc theo mặt phẳng tiếp tuyến (Tangent-Plane Laplacian Relaxation) sử dụng mảng đệm tĩnh không cấp phát rác bộ nhớ:
+        /// Giúp các ô lưới dốc khi uốn mạnh trở nên đều đặn tuyệt đối mà KHÔNG làm xẹp chiều cao hay độ phồng của nếp uốn.
+        /// </summary>
+        private static void EqualizeGridTangentially(
+            MeshData mesh,
+            int[][] adj,
+            bool[] isBoundary,
+            float[]? peakWeights,
+            ref Vec3[]? nextVerts,
+            int iterations = 6,
+            float strength = 0.36f)
+        {
+            var verts = mesh.Vertices;
+            int n = verts.Count;
+            if (n < 4 || adj.Length != n || isBoundary.Length != n) return;
+
+            if (nextVerts == null || nextVerts.Length != n)
+                nextVerts = new Vec3[n];
+
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                if (iter == 0 || iter == iterations / 2)
+                {
+                    mesh.RecalculateNormals();
+                    EnsureConsistentNormals(mesh);
+                }
+
+                for (int i = 0; i < n; i++)
+                {
+                    int[] nbs = adj[i];
+                    if (isBoundary[i] || nbs.Length == 0)
+                    {
+                        nextVerts[i] = verts[i];
+                        continue;
+                    }
+
+                    float pin = 0f;
+                    if (peakWeights != null && i < peakWeights.Length)
+                    {
+                        float pw = peakWeights[i];
+                        if (pw >= 0.96f) { nextVerts[i] = verts[i]; continue; }
+                        if (pw > 0.84f) pin = Clamp01((pw - 0.84f) / 0.12f);
+                    }
+
+                    Vec3 sum = Vec3.Zero;
+                    for (int j = 0; j < nbs.Length; j++)
+                        sum = sum + verts[nbs[j]];
+                    Vec3 avg = sum / nbs.Length;
+
+                    Vec3 lap = avg - verts[i];
+                    Vec3 nrm = i < mesh.Normals.Count ? mesh.Normals[i] : Vec3.Forward;
+                    Vec3 tangentStep = lap - nrm * Vec3.Dot(lap, nrm);
+                    nextVerts[i] = verts[i] + tangentStep * (strength * (1f - pin));
+                }
+
+                for (int i = 0; i < n; i++)
+                    verts[i] = nextVerts[i];
+            }
+        }
+
+        /// <summary>
+        /// Tạo lưới hiển thị mịn (Catmull-Clark 4x/16x + Dàn đều tiếp tuyến) trên nền lưới gốc.
+        /// Tái sử dụng SubdivTopologyCache để khi kéo Điểm/Cạnh/Slider không tốn CPU chia lưới lại từ đầu.
+        /// </summary>
+        public static void RebuildDisplayMesh(ClothEntity cloth)
+        {
+            int level = Math.Max(0, Math.Min(2, cloth.SubdivisionLevel));
+            cloth.Mesh.EnsureRestVerticesInitialized();
+
+            if (level == 0 && !cloth.EqualizeGridOnBend)
+            {
+                cloth.RenderSubdividedMesh = null;
+                cloth.SubdivCache = null;
+                return;
+            }
+
+            int baseV = cloth.Mesh.RestVertices.Count;
+            int baseF = cloth.Mesh.Faces.Count;
+            float restChecksum = ComputeRestChecksum(cloth.Mesh.RestVertices);
+
+            var cache = cloth.SubdivCache;
+            bool cacheHit = cache != null &&
+                            cache.Level == level &&
+                            cache.BaseVertCount == baseV &&
+                            cache.BaseFaceCount == baseF &&
+                            Math.Abs(cache.RestChecksum - restChecksum) < 1e-4f &&
+                            cache.TemplateMesh.RestVertices.Count > 0;
+
+            if (!cacheHit)
+            {
+                MeshData template;
+                if (level == 0)
+                {
+                    template = new MeshData
+                    {
+                        Name = cloth.Mesh.Name,
+                        Vertices = new List<Vec3>(cloth.Mesh.Vertices),
+                        RestVertices = new List<Vec3>(cloth.Mesh.RestVertices),
+                        Normals = new List<Vec3>(cloth.Mesh.Normals),
+                        UVs = new List<Vec2>(cloth.Mesh.UVs),
+                        Triangles = new List<int>(cloth.Mesh.Triangles),
+                        TriangleToFace = new List<int>(cloth.Mesh.TriangleToFace),
+                        Faces = cloth.Mesh.Faces.Select(f => new List<int>(f)).ToList()
+                    };
+                }
+                else
+                {
+                    template = SubdivideCatmullClarkOnce(cloth.Mesh, preserveParentMapping: false);
+                    for (int s = 1; s < level; s++)
+                        template = SubdivideCatmullClarkOnce(template, preserveParentMapping: true);
+                }
+
+                BuildStaticTopologyData(template, out var flatAdj, out var isBoundary);
+                cloth.CachedBorders = null;
+                cache = new SubdivTopologyCache
+                {
+                    Level = level,
+                    BaseVertCount = baseV,
+                    BaseFaceCount = baseF,
+                    RestChecksum = restChecksum,
+                    TemplateMesh = template,
+                    Adjacency = flatAdj,
+                    IsBoundary = isBoundary
+                };
+                cloth.SubdivCache = cache;
+            }
+
+            var tmpl = cache!.TemplateMesh;
+            MeshData work = cloth.RenderSubdividedMesh != null &&
+                            cloth.RenderSubdividedMesh.Vertices.Count == tmpl.RestVertices.Count &&
+                            cloth.RenderSubdividedMesh.Faces.Count == tmpl.Faces.Count
+                ? cloth.RenderSubdividedMesh
+                : new MeshData
+                {
+                    Name = tmpl.Name,
+                    Vertices = new List<Vec3>(tmpl.RestVertices),
+                    RestVertices = tmpl.RestVertices,
+                    Normals = new List<Vec3>(tmpl.RestVertices.Count),
+                    UVs = tmpl.UVs,
+                    Triangles = tmpl.Triangles,
+                    TriangleToFace = tmpl.TriangleToFace,
+                    Faces = tmpl.Faces,
+                    SubdivParentFaces = tmpl.SubdivParentFaces
+                };
+
+            CollectActiveControls(cloth, cloth.Mesh, out var activeEdges, out var activePoints, out _);
+            ApplyControlsToVertices(tmpl.RestVertices, work.Vertices, activeEdges, activePoints, ref cache.ScratchPeakWeights);
+
+            if (cloth.EqualizeGridOnBend && (activeEdges.Count > 0 || activePoints.Count > 0))
+                EqualizeGridTangentially(work, cache.Adjacency, cache.IsBoundary, cache.ScratchPeakWeights, ref cache.ScratchNextVerts, iterations: 6, strength: 0.36f);
+
+            work.RecalculateNormals();
+            EnsureConsistentNormals(work);
+            cloth.RenderSubdividedMesh = work;
+        }
+
+        /// <summary>
+        /// Chia mịn vĩnh viễn lưới gốc của mảnh vải thêm 1 cấp Catmull-Clark (x4 số ô tứ giác).
+        /// </summary>
+        public static void SubdivideBaseClothMesh(ClothEntity cloth)
+        {
+            cloth.Mesh.EnsureRestVerticesInitialized();
+            if (cloth.Mesh.Faces.Count == 0 && cloth.Mesh.Triangles.Count == 0) return;
+
+            var sub = SubdivideCatmullClarkOnce(cloth.Mesh, preserveParentMapping: false);
+            sub.SubdivParentFaces = null;
+            cloth.Mesh = sub;
+            cloth.SubdivCache = null;
+            cloth.SelectedFaces.Clear();
+            cloth.SelectedTriangles.Clear();
+            cloth.SelectedVertices.Clear();
+            cloth.ActiveRegion = null;
+            cloth.CachedBorders = null;
+            RebuildClothDeformationFromControls(cloth);
+        }
+
+        /// <summary>
+        /// Tái tạo toàn bộ biến dạng của mảnh vải từ RestVertices dựa trên tập hợp tất cả ControlEdge và ControlPoint đang hoạt động.
+        /// Cho phép mỗi cạnh/điểm gần nhau giữ nguyên thông số Độ uốn (Bending) & Bán kính riêng biệt và cập nhật trực tiếp khi kéo slider.
+        /// </summary>
+        public static void RebuildClothDeformationFromControls(ClothEntity cloth)
+        {
+            var mesh = cloth.Mesh;
+            mesh.EnsureRestVerticesInitialized();
+            var restVerts = mesh.RestVertices;
+            var verts = mesh.Vertices;
+            if (verts.Count == 0 || restVerts.Count != verts.Count)
+                return;
+
+            CollectActiveControls(cloth, mesh, out var activeEdges, out var activePoints, out var pointsOnActiveEdges);
+            float[]? dummyPeaks = null;
+            ApplyControlsToVertices(restVerts, verts, activeEdges, activePoints, ref dummyPeaks);
+
+            for (int i = 0; i < cloth.Points.Count; i++)
+            {
+                var pt = cloth.Points[i];
+                if (pt.IsEdited || pointsOnActiveEdges.Contains(pt.Id))
+                    continue;
+
+                if (pt.AttachedVertexIndex >= 0 && pt.AttachedVertexIndex < verts.Count)
+                    pt.Position = verts[pt.AttachedVertexIndex];
+            }
+
+            mesh.RecalculateNormals();
+            EnsureConsistentNormals(mesh);
+            RebuildDisplayMesh(cloth);
+        }
+
         /// <summary>
         /// Di chuyển 1 Điểm điều khiển bằng deltaMove:
-        /// - Nếu Điểm thuộc 1 hay nhiều Cạnh (ControlEdge), đồng thời uốn mượt theo TẤT CẢ các cạnh nối vào Điểm đó!
-        /// - Dùng RestVertices làm hệ quy chiếu khoảng cách bề mặt để giữ nếp uốn cong đều (chữ S/U), không bị gồ ghề khi kéo nhiều bước.
+        /// - Nếu Điểm thuộc 1 hay nhiều Cạnh (ControlEdge), đánh dấu điểm & các cạnh nối đã chỉnh sửa và tái tạo toàn bộ biến dạng đồng nhất trên lưới.
+        /// - Dùng RestVertices làm hệ quy chiếu không phá hủy để mọi nếp uốn liền lạc và giữ đúng Độ uốn riêng của từng cạnh.
         /// </summary>
         public static void MoveControlPoint(ClothEntity cloth, ControlPoint point, Vec3 deltaMove)
         {
             if (deltaMove.LengthSquared < 1e-10f) return;
             cloth.Mesh.EnsureRestVerticesInitialized();
 
-            // Lấy TẤT CẢ các Cạnh nối vào Điểm này (trước đây chỉ lấy cạnh [0] làm cạnh còn lại bị bỏ qua gây gãy gồ ghề!)
-            var connectedEdges = new List<ControlEdge>();
+            point.IsEdited = true;
+            point.Position = point.Position + deltaMove;
             foreach (var e in cloth.Edges)
             {
                 if (e.PointAId == point.Id || e.PointBId == point.Id)
-                    connectedEdges.Add(e);
+                    e.IsEdited = true;
             }
 
-            if (connectedEdges.Count > 0)
-            {
-                Vec3 ptRest = GetPointRestPosition(cloth.Mesh, point);
-                var restVerts = cloth.Mesh.RestVertices;
-                var verts = cloth.Mesh.Vertices;
-
-                var segments = new List<(Vec3 otherRest, float radius, float bending)>(connectedEdges.Count);
-                foreach (var e in connectedEdges)
-                {
-                    Guid otherId = e.PointAId == point.Id ? e.PointBId : e.PointAId;
-                    ControlPoint? otherPt = cloth.FindPoint(otherId);
-                    if (otherPt == null) continue;
-                    segments.Add((GetPointRestPosition(cloth.Mesh, otherPt), Math.Max(0.01f, e.Radius), Clamp01(e.Bending)));
-                }
-
-                if (segments.Count > 0)
-                {
-                    for (int i = 0; i < verts.Count; i++)
-                    {
-                        Vec3 pRest = restVerts[i];
-                        float bestW = 0f;
-                        for (int s = 0; s < segments.Count; s++)
-                        {
-                            var seg = segments[s];
-                            Vec3 closest = ClosestPointOnSegment3D(pRest, ptRest, seg.otherRest, out float t);
-                            float d = Vec3.Distance(pRest, closest);
-                            if (d <= seg.radius)
-                            {
-                                float wRadial = EvaluateBendingWeight(d / seg.radius, seg.bending);
-                                float wAxial = EvaluateBendingWeight(t, seg.bending);
-                                float wEdge = wRadial * wAxial;
-                                if (wEdge > bestW) bestW = wEdge;
-                            }
-                        }
-
-                        if (bestW > 1e-5f)
-                        {
-                            verts[i] = verts[i] + deltaMove * bestW;
-                        }
-                    }
-
-                    point.Position = point.Position + deltaMove;
-                    SyncAttachedControlPoints(cloth, point.Id);
-                    cloth.Mesh.RecalculateNormals();
-                    EnsureConsistentNormals(cloth.Mesh);
-                    return;
-                }
-            }
-
-            // Điểm đứng độc lập -> uốn theo Vùng Cầu quanh RestPosition của Điểm
-            DeformClothByPointSphere(cloth, point, deltaMove);
+            cloth.CachedBorders = null;
+            RebuildClothDeformationFromControls(cloth);
         }
 
         /// <summary>
@@ -1316,33 +1949,17 @@ namespace CrimiradTailoring.Core.Engine
         /// </summary>
         public static void DeformClothByPointSphere(ClothEntity cloth, ControlPoint point, Vec3 deltaMove)
         {
+            if (deltaMove.LengthSquared < 1e-10f) return;
             cloth.Mesh.EnsureRestVerticesInitialized();
-            Vec3 originRest = GetPointRestPosition(cloth.Mesh, point);
-            float radius = Math.Max(0.01f, point.Radius);
-            float bending = Clamp01(point.Bending);
-
-            var restVerts = cloth.Mesh.RestVertices;
-            var verts = cloth.Mesh.Vertices;
-            for (int i = 0; i < verts.Count; i++)
-            {
-                float d = Vec3.Distance(restVerts[i], originRest);
-                if (d <= radius)
-                {
-                    float s = d / radius; // [0..1]
-                    float w = EvaluateBendingWeight(s, bending);
-                    verts[i] = verts[i] + deltaMove * w;
-                }
-            }
-
+            point.IsEdited = true;
             point.Position = point.Position + deltaMove;
-            SyncAttachedControlPoints(cloth, point.Id);
-            cloth.Mesh.RecalculateNormals();
-            EnsureConsistentNormals(cloth.Mesh);
+            cloth.CachedBorders = null;
+            RebuildClothDeformationFromControls(cloth);
         }
 
         /// <summary>
         /// Uốn Vùng Trụ (Cylindrical / Capsule Falloff) xung quanh trục Cạnh (PointA - PointB)
-        /// sử dụng khoảng cách trên lưới gốc (RestVertices) để tạo nếp gấp chữ S/U mượt tuyệt đối.
+        /// sử dụng khoảng cách trên lưới gốc (RestVertices) và hòa trộn Partition-of-Unity giữa các cạnh lân cận.
         /// </summary>
         public static void DeformClothByEdgeCylinder(
             ClothEntity cloth,
@@ -1355,36 +1972,14 @@ namespace CrimiradTailoring.Core.Engine
             if (pA == null || pB == null) return;
 
             cloth.Mesh.EnsureRestVerticesInitialized();
-            Vec3 a0 = pA.Position;
-            Vec3 b0 = pB.Position;
-            Vec3 aRest = GetPointRestPosition(cloth.Mesh, pA);
-            Vec3 bRest = GetPointRestPosition(cloth.Mesh, pB);
-            float radius = Math.Max(0.01f, edge.Radius);
-            float bending = Clamp01(edge.Bending);
+            edge.IsEdited = true;
+            pA.IsEdited = true;
+            pB.IsEdited = true;
+            pA.Position = pA.Position + deltaA;
+            pB.Position = pB.Position + deltaB;
 
-            var restVerts = cloth.Mesh.RestVertices;
-            var verts = cloth.Mesh.Vertices;
-            bool sameDelta = (deltaA - deltaB).LengthSquared < 1e-10f;
-
-            for (int i = 0; i < verts.Count; i++)
-            {
-                Vec3 closestOnAxis = ClosestPointOnSegment3D(restVerts[i], aRest, bRest, out float t);
-                float d = Vec3.Distance(restVerts[i], closestOnAxis);
-                if (d <= radius)
-                {
-                    float s = d / radius; // [0..1]
-                    float w = EvaluateBendingWeight(s, bending);
-                    float smoothT = sameDelta ? t : (1f - EvaluateBendingWeight(t, bending));
-                    Vec3 axisDisp = Vec3.Lerp(deltaA, deltaB, smoothT);
-                    verts[i] = verts[i] + axisDisp * w;
-                }
-            }
-
-            pA.Position = a0 + deltaA;
-            pB.Position = b0 + deltaB;
-            SyncAttachedControlPoints(cloth, pA.Id, pB.Id);
-            cloth.Mesh.RecalculateNormals();
-            EnsureConsistentNormals(cloth.Mesh);
+            cloth.CachedBorders = null;
+            RebuildClothDeformationFromControls(cloth);
         }
 
         /// <summary>
@@ -1402,10 +1997,37 @@ namespace CrimiradTailoring.Core.Engine
 
             for (int i = 0; i < cloth.Points.Count; i++)
                 cloth.Points[i].Position = cloth.Points[i].Position + delta;
+
+            if (cloth.CustomOrigin.HasValue)
+                cloth.CustomOrigin = cloth.CustomOrigin.Value + delta;
+
+            if (cloth.RenderSubdividedMesh != null)
+            {
+                var sm = cloth.RenderSubdividedMesh;
+                for (int i = 0; i < sm.Vertices.Count; i++) sm.Vertices[i] = sm.Vertices[i] + delta;
+                if (cloth.SubdivCache != null && !ReferenceEquals(sm.RestVertices, cloth.SubdivCache.TemplateMesh.RestVertices))
+                {
+                    for (int i = 0; i < sm.RestVertices.Count; i++) sm.RestVertices[i] = sm.RestVertices[i] + delta;
+                }
+            }
+            if (cloth.SubdivCache != null)
+            {
+                var tr = cloth.SubdivCache.TemplateMesh.RestVertices;
+                for (int i = 0; i < tr.Count; i++) tr[i] = tr[i] + delta;
+                cloth.SubdivCache.RestChecksum = ComputeRestChecksum(cloth.Mesh.RestVertices);
+            }
+            cloth.CachedBorders = null;
         }
 
         /// <summary>
-        /// Phóng to / Thu nhỏ (Scale) mảnh vải quanh tâm hiện tại của nó.
+        /// Trả về tọa độ Origin (tâm xoay / phóng to thu nhỏ) của mảnh vải:
+        /// ưu tiên CustomOrigin nếu người dùng đã Set Origin vào điểm, ngược lại dùng tâm hình học.
+        /// </summary>
+        public static Vec3 GetClothOrigin(ClothEntity cloth) =>
+            cloth.CustomOrigin ?? GetClothCentroid(cloth);
+
+        /// <summary>
+        /// Phóng to / Thu nhỏ (Scale) mảnh vải quanh Origin hiện tại của nó (CustomOrigin hoặc tâm hình học).
         /// </summary>
         public static void ScaleClothEntity(ClothEntity cloth, float newScaleX, float newScaleY)
         {
@@ -1418,7 +2040,7 @@ namespace CrimiradTailoring.Core.Engine
                 return;
 
             cloth.Mesh.EnsureRestVerticesInitialized();
-            Vec3 center = GetClothCentroid(cloth);
+            Vec3 center = GetClothOrigin(cloth);
             for (int i = 0; i < cloth.Mesh.Vertices.Count; i++)
             {
                 Vec3 rel = cloth.Mesh.Vertices[i] - center;
@@ -1433,10 +2055,11 @@ namespace CrimiradTailoring.Core.Engine
             SyncAttachedControlPoints(cloth);
             cloth.Mesh.RecalculateNormals();
             EnsureConsistentNormals(cloth.Mesh);
+            RebuildDisplayMesh(cloth);
         }
 
         /// <summary>
-        /// Xoay toàn bộ mảnh vải quanh một trục 3D bất kỳ đi qua tâm (hoặc pivot tùy chọn) bằng công thức Rodrigues.
+        /// Xoay toàn bộ mảnh vải quanh một trục 3D bất kỳ đi qua Origin (hoặc pivot tùy chọn) bằng công thức Rodrigues.
         /// </summary>
         public static void RotateClothAroundAxis(
             ClothEntity cloth,
@@ -1448,7 +2071,7 @@ namespace CrimiradTailoring.Core.Engine
                 return;
 
             cloth.Mesh.EnsureRestVerticesInitialized();
-            Vec3 pivot = customPivot ?? GetClothCentroid(cloth);
+            Vec3 pivot = customPivot ?? GetClothOrigin(cloth);
             Vec3 k = axis.Normalized;
             float rad = angleDeg * (float)Math.PI / 180f;
             float cosA = (float)Math.Cos(rad);
@@ -1470,12 +2093,16 @@ namespace CrimiradTailoring.Core.Engine
             for (int i = 0; i < cloth.Points.Count; i++)
                 cloth.Points[i].Position = RotateVec(cloth.Points[i].Position);
 
+            if (cloth.CustomOrigin.HasValue && customPivot.HasValue)
+                cloth.CustomOrigin = RotateVec(cloth.CustomOrigin.Value);
+
             cloth.Mesh.RecalculateNormals();
             EnsureConsistentNormals(cloth.Mesh);
+            RebuildDisplayMesh(cloth);
         }
 
         /// <summary>
-        /// Xoay mảnh vải đến góc Euler mục tiêu (RotXDeg, RotYDeg, RotZDeg) quanh tâm hiện tại của mảnh vải.
+        /// Xoay mảnh vải đến góc Euler mục tiêu (RotXDeg, RotYDeg, RotZDeg) quanh Origin hiện tại của mảnh vải.
         /// </summary>
         public static void RotateClothToEuler(
             ClothEntity cloth,
@@ -1489,7 +2116,7 @@ namespace CrimiradTailoring.Core.Engine
             if (Math.Abs(dX) < 1e-4f && Math.Abs(dY) < 1e-4f && Math.Abs(dZ) < 1e-4f)
                 return;
 
-            Vec3 center = GetClothCentroid(cloth);
+            Vec3 center = GetClothOrigin(cloth);
             if (Math.Abs(dX) >= 1e-4f) RotateClothAroundAxis(cloth, Vec3.Right, dX, center);
             if (Math.Abs(dY) >= 1e-4f) RotateClothAroundAxis(cloth, Vec3.Up, dY, center);
             if (Math.Abs(dZ) >= 1e-4f) RotateClothAroundAxis(cloth, Vec3.Forward, dZ, center);
@@ -1569,10 +2196,610 @@ namespace CrimiradTailoring.Core.Engine
             return sum / verts.Count;
         }
 
+        private static Vec3 GetClothAverageNormal(MeshData mesh, IReadOnlyList<Vec3> verts)
+        {
+            Vec3 sum = Vec3.Zero;
+            for (int t = 0; t + 2 < mesh.Triangles.Count; t += 3)
+            {
+                Vec3 a = verts[mesh.Triangles[t]];
+                Vec3 b = verts[mesh.Triangles[t + 1]];
+                Vec3 c = verts[mesh.Triangles[t + 2]];
+                sum = sum + Vec3.Cross(b - a, c - a);
+            }
+            return sum.LengthSquared > 1e-10f ? sum.Normalized : Vec3.Forward;
+        }
+
+        private static List<int>[] BuildVertexAdjacency(MeshData mesh)
+        {
+            int n = mesh.Vertices.Count;
+            var adj = new List<int>[n];
+            for (int i = 0; i < n; i++) adj[i] = new List<int>(6);
+
+            void AddUndir(int a, int b)
+            {
+                if (a == b || a < 0 || b < 0 || a >= n || b >= n) return;
+                if (!adj[a].Contains(b)) adj[a].Add(b);
+                if (!adj[b].Contains(a)) adj[b].Add(a);
+            }
+
+            if (mesh.Faces.Count > 0)
+            {
+                foreach (var f in mesh.Faces)
+                {
+                    for (int k = 0; k < f.Count; k++)
+                        AddUndir(f[k], f[(k + 1) % f.Count]);
+                }
+            }
+            else
+            {
+                for (int t = 0; t + 2 < mesh.Triangles.Count; t += 3)
+                {
+                    AddUndir(mesh.Triangles[t], mesh.Triangles[t + 1]);
+                    AddUndir(mesh.Triangles[t + 1], mesh.Triangles[t + 2]);
+                    AddUndir(mesh.Triangles[t + 2], mesh.Triangles[t]);
+                }
+            }
+
+            return adj;
+        }
+
+        /// <summary>
+        /// Phát hiện các cạnh biên thực tế của mảnh vải (chuỗi cạnh chu vi chia tại các góc gãy >= 32°),
+        /// hỗ trợ cả mảnh vuông lẫn mảnh đã cắt lỗ / tạo hình thang / uốn cong.
+        /// </summary>
+        public static List<ClothBorderEdge> DetectClothBorderEdges(ClothEntity cloth, IReadOnlyList<Vec3>? refVerts = null)
+        {
+            var result = new List<ClothBorderEdge>();
+            var mesh = cloth.Mesh;
+            var verts = refVerts ?? mesh.Vertices;
+            if (verts.Count < 3) return result;
+
+            var edgeCounts = new Dictionary<long, int>();
+            var orientedEdges = new List<(int a, int b)>();
+
+            void CountEdge(int a, int b)
+            {
+                if (a == b) return;
+                long key = a < b ? (((long)a << 32) | (uint)b) : (((long)b << 32) | (uint)a);
+                edgeCounts.TryGetValue(key, out int c);
+                edgeCounts[key] = c + 1;
+                orientedEdges.Add((a, b));
+            }
+
+            if (mesh.Faces.Count > 0)
+            {
+                foreach (var f in mesh.Faces)
+                {
+                    for (int k = 0; k < f.Count; k++)
+                        CountEdge(f[k], f[(k + 1) % f.Count]);
+                }
+            }
+            else
+            {
+                for (int t = 0; t + 2 < mesh.Triangles.Count; t += 3)
+                {
+                    CountEdge(mesh.Triangles[t], mesh.Triangles[t + 1]);
+                    CountEdge(mesh.Triangles[t + 1], mesh.Triangles[t + 2]);
+                    CountEdge(mesh.Triangles[t + 2], mesh.Triangles[t]);
+                }
+            }
+
+            var outMap = new Dictionary<int, List<int>>();
+            var boundaryHalfEdges = new List<(int a, int b)>();
+            foreach (var (a, b) in orientedEdges)
+            {
+                long key = a < b ? (((long)a << 32) | (uint)b) : (((long)b << 32) | (uint)a);
+                if (edgeCounts.TryGetValue(key, out int cnt) && cnt == 1)
+                {
+                    boundaryHalfEdges.Add((a, b));
+                    if (!outMap.TryGetValue(a, out var list))
+                    {
+                        list = new List<int>(2);
+                        outMap[a] = list;
+                    }
+                    list.Add(b);
+                }
+            }
+
+            if (boundaryHalfEdges.Count < 3) return result;
+
+            var usedHalfEdges = new HashSet<long>();
+            var loops = new List<List<int>>();
+
+            foreach (var (startA, startB) in boundaryHalfEdges)
+            {
+                long firstKey = ((long)startA << 32) | (uint)startB;
+                if (!usedHalfEdges.Add(firstKey)) continue;
+
+                var loop = new List<int> { startA };
+                int prev = startA;
+                int curr = startB;
+                int guard = boundaryHalfEdges.Count + 4;
+
+                while (curr != startA && guard-- > 0)
+                {
+                    loop.Add(curr);
+                    if (!outMap.TryGetValue(curr, out var nextCandidates) || nextCandidates.Count == 0)
+                        break;
+
+                    int chosen = -1;
+                    float bestScore = float.MinValue;
+                    Vec3 inDir = (verts[curr] - verts[prev]).Normalized;
+                    foreach (int nxt in nextCandidates)
+                    {
+                        long ek = ((long)curr << 32) | (uint)nxt;
+                        if (usedHalfEdges.Contains(ek)) continue;
+                        Vec3 outDir = (verts[nxt] - verts[curr]).Normalized;
+                        float score = Vec3.Dot(inDir, outDir);
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            chosen = nxt;
+                        }
+                    }
+                    if (chosen < 0) break;
+                    usedHalfEdges.Add(((long)curr << 32) | (uint)chosen);
+                    prev = curr;
+                    curr = chosen;
+                }
+
+                if (loop.Count >= 3)
+                    loops.Add(loop);
+            }
+
+            Vec3 meshCenter = Vec3.Zero;
+            for (int i = 0; i < verts.Count; i++) meshCenter = meshCenter + verts[i];
+            meshCenter = meshCenter / verts.Count;
+
+            string DescribeDirection(Vec3 mid)
+            {
+                Vec3 off = mid - meshCenter;
+                float ax = Math.Abs(off.X), ay = Math.Abs(off.Y), az = Math.Abs(off.Z);
+                if (ay >= ax && ay >= az) return off.Y >= 0 ? "Trên" : "Dưới";
+                if (ax >= ay && ax >= az) return off.X >= 0 ? "Phải" : "Trái";
+                return off.Z >= 0 ? "Trước" : "Sau";
+            }
+
+            int borderIdx = 0;
+            for (int loopId = 0; loopId < loops.Count; loopId++)
+            {
+                var loop = loops[loopId];
+                int k = loop.Count;
+                var cornerDots = new float[k];
+                var candidateCorners = new List<int>();
+
+                // Phát hiện đỉnh góc có độ gập >= 32° (cos <= 0.848)
+                for (int i = 0; i < k; i++)
+                {
+                    Vec3 pPrev = verts[loop[(i - 1 + k) % k]];
+                    Vec3 pCurr = verts[loop[i]];
+                    Vec3 pNext = verts[loop[(i + 1) % k]];
+                    Vec3 d1 = (pCurr - pPrev).Normalized;
+                    Vec3 d2 = (pNext - pCurr).Normalized;
+                    float dot = Vec3.Dot(d1, d2);
+                    cornerDots[i] = dot;
+                    if (dot < 0.848f)
+                        candidateCorners.Add(i);
+                }
+
+                // Khử đỉnh góc kề sát nhau để giữ góc nhọn nhất
+                var corners = new List<int>();
+                for (int c = 0; c < candidateCorners.Count; c++)
+                {
+                    int idx = candidateCorners[c];
+                    int prevIdx = (idx - 1 + k) % k;
+                    int nextIdx = (idx + 1) % k;
+                    if (k > 6 && ((cornerDots[prevIdx] < cornerDots[idx] && cornerDots[prevIdx] < 0.848f) ||
+                                  (cornerDots[nextIdx] < cornerDots[idx] && cornerDots[nextIdx] < 0.848f)))
+                        continue;
+                    corners.Add(idx);
+                }
+
+                if (corners.Count >= 2)
+                {
+                    for (int c = 0; c < corners.Count; c++)
+                    {
+                        int sPos = corners[c];
+                        int ePos = corners[(c + 1) % corners.Count];
+                        var chain = new List<int>();
+                        int curPos = sPos;
+                        int stepGuard = k + 2;
+                        while (stepGuard-- > 0)
+                        {
+                            chain.Add(loop[curPos]);
+                            if (curPos == ePos) break;
+                            curPos = (curPos + 1) % k;
+                        }
+                        if (chain.Count < 2) continue;
+
+                        Vec3 mid = Vec3.Zero;
+                        float arcLen = 0f;
+                        for (int i = 0; i < chain.Count; i++)
+                        {
+                            mid = mid + verts[chain[i]];
+                            if (i > 0) arcLen += Vec3.Distance(verts[chain[i - 1]], verts[chain[i]]);
+                        }
+                        mid = mid / chain.Count;
+                        float chord = Vec3.Distance(verts[chain[0]], verts[chain[chain.Count - 1]]);
+
+                        result.Add(new ClothBorderEdge
+                        {
+                            Index = borderIdx,
+                            LoopId = loopId,
+                            IsClosedLoop = false,
+                            VertexIndices = chain,
+                            Midpoint = mid,
+                            ChordLength = chord,
+                            ArcLength = arcLen,
+                            Name = $"Biên #{borderIdx + 1} ({DescribeDirection(mid)})"
+                        });
+                        borderIdx++;
+                    }
+                }
+                else
+                {
+                    Vec3 mid = Vec3.Zero;
+                    float arcLen = 0f;
+                    for (int i = 0; i < k; i++)
+                    {
+                        mid = mid + verts[loop[i]];
+                        arcLen += Vec3.Distance(verts[loop[i]], verts[loop[(i + 1) % k]]);
+                    }
+                    mid = mid / k;
+                    result.Add(new ClothBorderEdge
+                    {
+                        Index = borderIdx,
+                        LoopId = loopId,
+                        IsClosedLoop = true,
+                        VertexIndices = new List<int>(loop),
+                        Midpoint = mid,
+                        ChordLength = arcLen / (float)Math.PI,
+                        ArcLength = arcLen,
+                        Name = $"Vòng biên #{borderIdx + 1}"
+                    });
+                    borderIdx++;
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Đo chiều dài dây cung và độ võng phẳng của cạnh biên MeshEdge hiện tại để Copy/Paste dáng biên.
+        /// </summary>
+        public static void MeasureBorderCurveProfile(
+            ClothEntity cloth,
+            ClothBorderEdge border,
+            out float chordLen,
+            out float arcOutSagitta)
+        {
+            chordLen = border.ChordLength;
+            arcOutSagitta = 0f;
+            var verts = cloth.Mesh.Vertices;
+            var chain = border.VertexIndices;
+            if (chain.Count < 3 || verts.Count == 0) return;
+
+            Vec3 pStart = verts[chain[0]];
+            Vec3 pEnd = verts[chain[chain.Count - 1]];
+            Vec3 chordVec = pEnd - pStart;
+            Vec3 chordDir = chordVec.LengthSquared > 1e-8f ? chordVec.Normalized : Vec3.Right;
+            Vec3 midPt = Vec3.Zero;
+            for (int i = 0; i < chain.Count; i++) midPt = midPt + verts[chain[i]];
+            midPt = midPt / chain.Count;
+
+            Vec3 meshCenter = GetClothCentroid(cloth);
+            Vec3 surfNormal = GetClothAverageNormal(cloth.Mesh, verts);
+            Vec3 inPlaneOut = Vec3.Cross(chordDir, surfNormal);
+            if (inPlaneOut.LengthSquared < 1e-6f) inPlaneOut = Vec3.Up;
+            inPlaneOut = inPlaneOut.Normalized;
+            if (Vec3.Dot(inPlaneOut, midPt - meshCenter) < 0f) inPlaneOut = -inPlaneOut;
+
+            Vec3 pMid = verts[chain[chain.Count / 2]];
+            Vec3 chordMid = (pStart + pEnd) * 0.5f;
+            arcOutSagitta = Vec3.Dot(pMid - chordMid, inPlaneOut);
+        }
+
+        /// <summary>
+        /// Biến dạng mượt toàn tấm vải theo một cạnh biên thực tế (Scale cạnh tạo hình thang, Cong phẳng tạo hình quạt/nón không chóp, Cong 3D, Xoay cạnh, Di chuyển cạnh).
+        /// Giải phương trình Laplace (∇²Δ = 0) với nội suy tuyến tính dọc các cạnh biên kề để giữ lưới tứ giác sạch đều tuyệt đối.
+        /// </summary>
+        public static void ApplyBorderEdgeDeformation(
+            ClothEntity cloth,
+            IReadOnlyList<ClothBorderEdge> allBorders,
+            ClothBorderEdge activeBorder,
+            float scaleFactor,
+            float arc2DMeters,
+            float wrap3DDeg,
+            Vec3 rotateAxis,
+            float rotateDeg,
+            Vec3 moveDelta,
+            IReadOnlyList<Vec3>? baseRestVerts = null,
+            IReadOnlyList<Vec3>? basePointPositions = null)
+        {
+            var mesh = cloth.Mesh;
+            mesh.EnsureRestVerticesInitialized();
+            int n = mesh.RestVertices.Count;
+            if (n < 3 || activeBorder.VertexIndices.Count < 2) return;
+
+            var src = baseRestVerts != null && baseRestVerts.Count == n
+                ? baseRestVerts
+                : new List<Vec3>(mesh.RestVertices);
+
+            bool isIdentity = Math.Abs(scaleFactor - 1f) < 1e-4f &&
+                              Math.Abs(arc2DMeters) < 1e-5f &&
+                              Math.Abs(wrap3DDeg) < 0.02f &&
+                              Math.Abs(rotateDeg) < 0.02f &&
+                              moveDelta.LengthSquared < 1e-10f;
+
+            if (isIdentity)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    mesh.RestVertices[i] = src[i];
+                    mesh.Vertices[i] = src[i];
+                }
+                if (basePointPositions != null && basePointPositions.Count == cloth.Points.Count)
+                {
+                    for (int p = 0; p < cloth.Points.Count; p++)
+                        cloth.Points[p].Position = basePointPositions[p];
+                }
+                RebuildClothDeformationFromControls(cloth);
+                return;
+            }
+
+            // 1. Tham số hình học cơ bản trên cạnh biên được chọn
+            var chain = activeBorder.VertexIndices;
+            int m = chain.Count;
+            var arcCum = new float[m];
+            Vec3 mid = Vec3.Zero;
+            for (int i = 0; i < m; i++)
+            {
+                mid = mid + src[chain[i]];
+                if (i > 0)
+                    arcCum[i] = arcCum[i - 1] + Vec3.Distance(src[chain[i - 1]], src[chain[i]]);
+            }
+            mid = mid / m;
+            float totalArc = Math.Max(1e-5f, arcCum[m - 1]);
+
+            Vec3 pStart = src[chain[0]];
+            Vec3 pEnd = src[chain[m - 1]];
+            Vec3 chordVec = pEnd - pStart;
+            Vec3 chordDir = chordVec.LengthSquared > 1e-8f ? chordVec.Normalized : Vec3.Right;
+            Vec3 surfNormal = GetClothAverageNormal(mesh, src);
+            Vec3 meshCenter = Vec3.Zero;
+            for (int i = 0; i < n; i++) meshCenter = meshCenter + src[i];
+            meshCenter = meshCenter / n;
+
+            Vec3 inPlaneOut = Vec3.Cross(chordDir, surfNormal);
+            if (inPlaneOut.LengthSquared < 1e-6f) inPlaneOut = Vec3.Up;
+            inPlaneOut = inPlaneOut.Normalized;
+            if (Vec3.Dot(inPlaneOut, mid - meshCenter) < 0f)
+                inPlaneOut = -inPlaneOut;
+
+            Vec3 rotAx = rotateAxis.LengthSquared > 1e-8f ? rotateAxis.Normalized : surfNormal;
+            float rotRad = rotateDeg * (float)Math.PI / 180f;
+            float cosR = (float)Math.Cos(rotRad);
+            float sinR = (float)Math.Sin(rotRad);
+
+            Vec3 RotateAroundMid(Vec3 pt)
+            {
+                Vec3 r = pt - mid;
+                return mid + r * cosR + Vec3.Cross(rotAx, r) * sinR + rotAx * (Vec3.Dot(rotAx, r) * (1f - cosR));
+            }
+
+            float cosPhi = (float)Math.Cos(1.15);
+            float denomPhi = Math.Max(1e-4f, 1f - cosPhi);
+
+            // 2. Tính độ dịch chuyển mục tiêu Δ cho các đỉnh trên cạnh biên đang chọn
+            var delta = new Vec3[n];
+            var isFixed = new bool[n];
+
+            for (int k = 0; k < m; k++)
+            {
+                int vi = chain[k];
+                Vec3 p0 = src[vi];
+                float t = arcCum[k] / totalArc; // [0..1]
+                Vec3 p = p0;
+
+                // a) Scale cạnh
+                if (Math.Abs(scaleFactor - 1f) >= 1e-4f)
+                {
+                    if (!activeBorder.IsClosedLoop)
+                    {
+                        float proj = Vec3.Dot(p - mid, chordDir);
+                        p = p + chordDir * (proj * (scaleFactor - 1f));
+                    }
+                    else
+                    {
+                        p = mid + (p - mid) * scaleFactor;
+                    }
+                }
+
+                // b) Cong Phẳng (tạo cung quạt / nón cụt trong mặt phẳng vải)
+                if (Math.Abs(arc2DMeters) >= 1e-5f)
+                {
+                    float u = 2f * t - 1f;
+                    float profile = ((float)Math.Cos(u * 1.15) - cosPhi) / denomPhi;
+                    p = p + inPlaneOut * (arc2DMeters * profile);
+                }
+
+                // c) Cong 3D (cuộn vòng cung theo pháp tuyến để uốn thành ống / nón 3D)
+                if (!activeBorder.IsClosedLoop && Math.Abs(wrap3DDeg) >= 0.02f)
+                {
+                    float scaledLen = Math.Max(0.02f, totalArc * scaleFactor);
+                    float theta = wrap3DDeg * (float)Math.PI / 180f;
+                    float rad = scaledLen / theta;
+                    float x = (t - 0.5f) * scaledLen;
+                    float ang = x / rad;
+                    Vec3 straightRef = mid + chordDir * x;
+                    Vec3 localOffset = p - straightRef;
+                    p = mid + chordDir * (rad * (float)Math.Sin(ang))
+                            + surfNormal * (rad * (1f - (float)Math.Cos(ang)))
+                            + localOffset;
+                }
+
+                // d) Xoay cạnh quanh trung điểm
+                if (Math.Abs(rotateDeg) >= 0.02f)
+                    p = RotateAroundMid(p);
+
+                // e) Di chuyển cạnh
+                p = p + moveDelta;
+
+                delta[vi] = p - p0;
+                isFixed[vi] = true;
+            }
+
+            // 3. Cố định các biên neo đối diện (=0) và nội suy tuyến tính 1D dọc 2 biên kề
+            var adjSides = new List<ClothBorderEdge>();
+            if (!activeBorder.IsClosedLoop && allBorders.Count >= 3)
+            {
+                int endA = chain[0];
+                int endB = chain[m - 1];
+                foreach (var b in allBorders)
+                {
+                    if (b == activeBorder || b.Index == activeBorder.Index || b.IsClosedLoop || b.VertexIndices.Count < 2)
+                        continue;
+
+                    bool isAdj = b.LoopId == activeBorder.LoopId &&
+                                 (b.VertexIndices[0] == endA || b.VertexIndices[b.VertexIndices.Count - 1] == endA ||
+                                  b.VertexIndices[0] == endB || b.VertexIndices[b.VertexIndices.Count - 1] == endB);
+
+                    if (isAdj)
+                    {
+                        adjSides.Add(b);
+                    }
+                    else
+                    {
+                        foreach (int vi in b.VertexIndices)
+                        {
+                            if (!isFixed[vi])
+                            {
+                                delta[vi] = Vec3.Zero;
+                                isFixed[vi] = true;
+                            }
+                        }
+                    }
+                }
+
+                foreach (var adjEdge in adjSides)
+                {
+                    var ac = adjEdge.VertexIndices;
+                    int am = ac.Count;
+                    var acArc = new float[am];
+                    for (int i = 1; i < am; i++)
+                        acArc[i] = acArc[i - 1] + Vec3.Distance(src[ac[i - 1]], src[ac[i]]);
+                    float acTotal = Math.Max(1e-5f, acArc[am - 1]);
+                    Vec3 d0 = isFixed[ac[0]] ? delta[ac[0]] : Vec3.Zero;
+                    Vec3 d1 = isFixed[ac[am - 1]] ? delta[ac[am - 1]] : Vec3.Zero;
+                    for (int i = 0; i < am; i++)
+                    {
+                        int vi = ac[i];
+                        if (!isFixed[vi])
+                        {
+                            delta[vi] = Vec3.Lerp(d0, d1, acArc[i] / acTotal);
+                            isFixed[vi] = true;
+                        }
+                    }
+                }
+            }
+            else if (!activeBorder.IsClosedLoop)
+            {
+                foreach (var b in allBorders)
+                {
+                    if (b == activeBorder || b.Index == activeBorder.Index) continue;
+                    foreach (int vi in b.VertexIndices)
+                    {
+                        if (!isFixed[vi])
+                        {
+                            delta[vi] = Vec3.Zero;
+                            isFixed[vi] = true;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Vòng biên khép kín: neo những đỉnh ở sâu nhất trong phần ruột lưới (gần tâm vùng)
+                var adjGraphTmp = BuildVertexAdjacency(mesh);
+                var dist = new int[n];
+                for (int i = 0; i < n; i++) dist[i] = -1;
+                var q = new Queue<int>();
+                for (int i = 0; i < n; i++)
+                {
+                    if (isFixed[i]) { dist[i] = 0; q.Enqueue(i); }
+                }
+                int maxD = 0;
+                while (q.Count > 0)
+                {
+                    int u = q.Dequeue();
+                    foreach (int nb in adjGraphTmp[u])
+                    {
+                        if (dist[nb] == -1)
+                        {
+                            dist[nb] = dist[u] + 1;
+                            if (dist[nb] > maxD) maxD = dist[nb];
+                            q.Enqueue(nb);
+                        }
+                    }
+                }
+                int anchorThreshold = Math.Max(1, (int)(maxD * 0.75f));
+                for (int i = 0; i < n; i++)
+                {
+                    if (!isFixed[i] && dist[i] >= anchorThreshold)
+                    {
+                        delta[i] = Vec3.Zero;
+                        isFixed[i] = true;
+                    }
+                }
+            }
+
+            // 4. Giải Laplace (SOR Gauss-Seidel) điền toàn bộ đỉnh bên trong
+            var adjGraph = BuildVertexAdjacency(mesh);
+            const float omega = 1.35f;
+            for (int iter = 0; iter < 48; iter++)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    if (isFixed[i]) continue;
+                    var nbs = adjGraph[i];
+                    if (nbs.Count == 0) continue;
+
+                    Vec3 sum = Vec3.Zero;
+                    for (int j = 0; j < nbs.Count; j++)
+                        sum = sum + delta[nbs[j]];
+                    Vec3 avg = sum / nbs.Count;
+                    delta[i] = delta[i] + (avg - delta[i]) * omega;
+                }
+            }
+
+            // 5. Ghi vào RestVertices và bảo toàn các điểm điều khiển gắn trên mặt vải
+            for (int i = 0; i < n; i++)
+            {
+                mesh.RestVertices[i] = src[i] + delta[i];
+                mesh.Vertices[i] = mesh.RestVertices[i];
+            }
+
+            for (int p = 0; p < cloth.Points.Count; p++)
+            {
+                var pt = cloth.Points[p];
+                Vec3 basePos = (basePointPositions != null && p < basePointPositions.Count)
+                    ? basePointPositions[p]
+                    : pt.Position;
+                if (pt.AttachedVertexIndex >= 0 && pt.AttachedVertexIndex < n)
+                    pt.Position = basePos + delta[pt.AttachedVertexIndex];
+                else
+                    pt.Position = basePos;
+            }
+
+            cloth.CachedBorders = null;
+            RebuildClothDeformationFromControls(cloth);
+        }
+
         /// <summary>
         /// Hàm trọng số Độ Uốn (Bending [0..1]) theo khoảng cách chuẩn hóa s = d / Radius:
-        /// - Bending = 0: Gập nhọn chữ V (Linear Falloff: 1 - s)
-        /// - Bending = 1: Uốn cong tròn mượt chữ U/S (Cosine Bell: (1 + cos(pi * s)) / 2)
+        /// - Bending = 0.0: Gập nhọn chữ V (Linear Falloff: 1 - s)
+        /// - Bending = 0.5: Uốn cong mượt hình chuông cos (Cosine Bell)
+        /// - Bending = 1.0: Mở rộng thành vòm tròn đều chữ U / Omega (Circular Dome Arch)
         /// </summary>
         public static float EvaluateBendingWeight(float normalizedDistS, float bending01)
         {
@@ -1582,7 +2809,17 @@ namespace CrimiradTailoring.Core.Engine
             float sharpLinear = 1f - s;
             float smoothCosine = 0.5f * (1f + (float)Math.Cos(s * Math.PI));
 
-            return (1f - b) * sharpLinear + b * smoothCosine;
+            if (b <= 0.5f)
+            {
+                float t = b * 2f;
+                return sharpLinear + (smoothCosine - sharpLinear) * t;
+            }
+
+            float u = (b - 0.5f) * 2f;
+            float circularDome = (float)Math.Sqrt(Math.Max(0f, 1f - s * s));
+            float broadCosine = (float)Math.Cos(s * Math.PI * 0.5);
+            float domeArch = broadCosine * 0.35f + circularDome * 0.65f;
+            return smoothCosine + (domeArch - smoothCosine) * u;
         }
 
         private static void SyncAttachedControlPoints(ClothEntity cloth, Guid? skipId1 = null, Guid? skipId2 = null)
@@ -1639,7 +2876,7 @@ namespace CrimiradTailoring.Core.Engine
             }
         }
 
-        public static void ExportSceneToObj(string filePath, IReadOnlyList<ClothEntity> cloths)
+        public static void ExportSceneToObj(string filePath, IReadOnlyList<ClothEntity> cloths, bool preferCharacterPose = false)
         {
             var sb = new StringBuilder();
             sb.AppendLine("# Crimirad Cloth Sculpting Export (Unity Ready)");
@@ -1647,7 +2884,9 @@ namespace CrimiradTailoring.Core.Engine
 
             foreach (var c in cloths)
             {
-                var m = c.Mesh;
+                var m = (preferCharacterPose && c.CharacterState.IsAttached && c.CharacterFittedMesh != null)
+                    ? c.CharacterFittedMesh
+                    : (c.RenderSubdividedMesh ?? c.Mesh);
                 if (m.Vertices.Count == 0) continue;
 
                 sb.AppendLine($"g {c.Name.Replace(' ', '_')}");
@@ -1772,6 +3011,7 @@ namespace CrimiradTailoring.Core.Engine
             EnsureConsistentNormals(mesh);
             mesh.RestVertices = new List<Vec3>(mesh.Vertices);
             cloth.Mesh = mesh;
+            RebuildDisplayMesh(cloth);
             return cloth;
         }
 

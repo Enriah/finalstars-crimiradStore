@@ -19,7 +19,7 @@ namespace CrimiradTailoring.Studio.Rendering
     /// Bộ render 3D GPU sử dụng OpenGL 3.3 Core (tương tự kiến trúc Viewport của Blender).
     /// Quản lý VAO/VBO/EBO theo từng ClothEntity và tái sử dụng primitive cầu/trụ/mũi tên để đạt 60+ FPS mượt mà.
     /// </summary>
-    public sealed class GlClothViewportRenderer : IDisposable
+    public sealed partial class GlClothViewportRenderer : IDisposable
     {
         private bool _initialized;
         private bool _disposed;
@@ -58,12 +58,27 @@ namespace CrimiradTailoring.Studio.Rendering
             public int NormalsVertexCount;
 
             public bool MeshDirty = true;
+            public bool WireDirty = true;
+            public bool NormalsDirty = true;
             public bool SelectionDirty = true;
+            public bool WireEboValid = false;
+            public bool SelectionEboValid = false;
             public MeshShadingSmoothMode BuiltSmoothMode;
             public float BuiltAutoSmoothDeg;
+            public int BuiltVertCount;
+            public int BuiltTriCount;
+            public int BuiltSubdivLevel;
+            public bool BuiltUsedSharedVertices;
+            public float[]? VboScratch;
+            public float[]? WireScratch;
 
             // Map tam giác gốc -> danh sách index đã split (nếu AutoSmooth/Flat phải tách đỉnh) hoặc 1:1 với Triangles
             public int[]? TriCornerMap;
+            public int[][]? VertToTrisFlat;
+            public bool VertToTrisValid = false;
+            public Vec3[]? RawTriNormalsScratch;
+            public Vec3[]? UnitTriNormalsScratch;
+            public Vec3[]? FaceNormSumScratch;
 
             public void Dispose()
             {
@@ -89,13 +104,12 @@ namespace CrimiradTailoring.Studio.Rendering
             GL.Enable(EnableCap.DepthTest);
             GL.DepthFunc(DepthFunction.Lequal);
             GL.Disable(EnableCap.CullFace);
-            GL.Enable(EnableCap.Multisample);
 
             CompileShaders();
             BuildFloorGridAndAxes();
-            BuildUnitSphere(12, 10);
+            BuildUnitSphere(10, 8);
             BuildUnitCylinder(10);
-            BuildUnitArrow(12);
+            BuildUnitArrow(10);
             BuildUnitRing(32);
 
             _dynamicOutlineVao = GL.GenVertexArray();
@@ -109,8 +123,10 @@ namespace CrimiradTailoring.Studio.Rendering
             if (_clothCaches.TryGetValue(clothId, out var cache))
             {
                 cache.MeshDirty = true;
-                cache.SelectionDirty = true;
+                cache.WireDirty = true;
+                cache.NormalsDirty = true;
             }
+            MarkCharacterClothDirty(clothId);
         }
 
         public void MarkClothSelectionDirty(Guid clothId)
@@ -118,7 +134,9 @@ namespace CrimiradTailoring.Studio.Rendering
             if (_clothCaches.TryGetValue(clothId, out var cache))
             {
                 cache.SelectionDirty = true;
+                cache.SelectionEboValid = false;
             }
+            _subVpDirty = true;
         }
 
         public void MarkAllDirty()
@@ -126,8 +144,12 @@ namespace CrimiradTailoring.Studio.Rendering
             foreach (var c in _clothCaches.Values)
             {
                 c.MeshDirty = true;
+                c.WireDirty = true;
+                c.NormalsDirty = true;
                 c.SelectionDirty = true;
+                c.SelectionEboValid = false;
             }
+            MarkAllCharacterClothsDirty();
         }
 
         public void MarkAllSelectionDirty()
@@ -135,6 +157,7 @@ namespace CrimiradTailoring.Studio.Rendering
             foreach (var c in _clothCaches.Values)
             {
                 c.SelectionDirty = true;
+                c.SelectionEboValid = false;
             }
         }
 
@@ -196,7 +219,10 @@ namespace CrimiradTailoring.Studio.Rendering
             bool showFloorGrid,
             bool showElements,
             bool showInfluence,
-            bool showMoveGizmo)
+            bool showMoveGizmo,
+            IReadOnlyList<ClothBorderEdge>? selectedClothBorders = null,
+            ClothBorderEdge? selectedBorderEdge = null,
+            bool highlightAllBorders = false)
         {
             EnsureInitialized();
             if (!_initialized) return;
@@ -205,54 +231,59 @@ namespace CrimiradTailoring.Studio.Rendering
             int h = Math.Max(1, pixelHeight);
             GL.Viewport(0, 0, w, h);
 
-            GL.ClearColor(0.059f, 0.071f, 0.098f, 1.0f); // #0F1219
+            GL.ClearColor(0.114f, 0.114f, 0.118f, 1.0f); // #1D1D1E xám đen
             GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
             ComputeCameraMatrices(w, h, camYawDeg, camPitchDeg, camDistance, camTarget, out Vector3 camPos, out Matrix4 viewProj);
 
             // 1. Lưới sàn Blender & trục X/Z
             if (showFloorGrid)
-            {
-                GL.UseProgram(_lineProgram);
-                GL.UniformMatrix4(GL.GetUniformLocation(_lineProgram, "uViewProj"), false, ref viewProj);
-                GL.Uniform1(GL.GetUniformLocation(_lineProgram, "uDepthBias"), 0.0f);
-
-                GL.LineWidth(1.0f);
-                GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.18f, 0.21f, 0.28f));
-                GL.BindVertexArray(_floorGridVao);
-                GL.DrawArrays(PrimitiveType.Lines, 0, _floorGridCount);
-
-                GL.LineWidth(2.0f);
-                GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.84f, 0.28f, 0.31f));
-                GL.BindVertexArray(_axisXVao);
-                GL.DrawArrays(PrimitiveType.Lines, 0, 2);
-
-                GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.28f, 0.65f, 0.43f));
-                GL.BindVertexArray(_axisZVao);
-                GL.DrawArrays(PrimitiveType.Lines, 0, 2);
-                GL.LineWidth(1.0f);
-            }
+                DrawFloorGridAndAxes(viewProj);
 
             PruneUnusedCloths(cloths);
 
             // 2. Các mảnh vải & Overlays (Wireframe, Normals, Selection Region Outline)
             foreach (var cloth in cloths)
             {
+                if (!cloth.IsVisible) continue;
                 if (!_clothCaches.TryGetValue(cloth.Id, out var cache))
                 {
                     cache = new ClothGpuCache();
                     _clothCaches[cloth.Id] = cache;
                 }
 
+                var activeMesh = cloth.RenderSubdividedMesh ?? cloth.Mesh;
+                int activeRenderVerts = activeMesh.Vertices.Count;
+                int activeRenderTris = activeMesh.Triangles.Count / 3;
                 if (cache.BuiltSmoothMode != cloth.SmoothMode ||
-                    Math.Abs(cache.BuiltAutoSmoothDeg - cloth.AutoSmoothAngleDeg) > 0.1f)
+                    Math.Abs(cache.BuiltAutoSmoothDeg - cloth.AutoSmoothAngleDeg) > 0.1f ||
+                    cache.BuiltVertCount != activeRenderVerts ||
+                    cache.BuiltTriCount != activeRenderTris ||
+                    cache.BuiltSubdivLevel != cloth.SubdivisionLevel)
                 {
+                    if (cache.BuiltVertCount != activeRenderVerts ||
+                        cache.BuiltTriCount != activeRenderTris ||
+                        cache.BuiltSubdivLevel != cloth.SubdivisionLevel)
+                    {
+                        cache.WireEboValid = false;
+                        cache.SelectionEboValid = false;
+                        cache.VertToTrisValid = false;
+                    }
                     cache.MeshDirty = true;
+                    cache.WireDirty = true;
+                    cache.NormalsDirty = true;
                     cache.SelectionDirty = true;
                 }
 
                 if (cache.MeshDirty)
                     UploadClothMeshAndWireToGpu(cloth, cache);
+
+                bool needWire = showWireOverlay || shadingMode == ViewportShadingMode.WireframeOnly;
+                if (needWire && (cache.WireDirty || cache.WireIndexCount == 0))
+                    UploadClothWireToGpu(cloth, cache);
+
+                if (showNormals && (cache.NormalsDirty || cache.NormalsVertexCount == 0))
+                    UploadClothNormalsToGpu(cloth, cache);
 
                 if (cache.SelectionDirty)
                     UploadClothSelectionIndicesToGpu(cloth, cache);
@@ -332,6 +363,7 @@ namespace CrimiradTailoring.Studio.Rendering
 
                 foreach (var cloth in cloths)
                 {
+                    if (!cloth.IsVisible) continue;
                     foreach (var edge in cloth.Edges)
                     {
                         var pA = cloth.FindPoint(edge.PointAId);
@@ -342,7 +374,7 @@ namespace CrimiradTailoring.Studio.Rendering
                                          (connectFirstEdge != null && connectFirstEdge.Id == edge.Id) ||
                                          (selectedEdgeIds != null && selectedEdgeIds.Contains(edge.Id));
 
-                        float cylRadius = isEdgeSel ? 0.011f : 0.008f;
+                        float cylRadius = isEdgeSel ? 0.0055f : 0.0038f;
                         Vector3 edgeCol = isEdgeSel ? new Vector3(1.0f, 0.65f, 0.18f) : new Vector3(0.92f, 0.94f, 0.98f);
                         DrawCylinderSegment(pA.Position, pB.Position, cylRadius, edgeCol);
                     }
@@ -353,7 +385,7 @@ namespace CrimiradTailoring.Studio.Rendering
                                        (connectFirstPoint != null && connectFirstPoint.Id == pt.Id) ||
                                        (selectedPointIds != null && selectedPointIds.Contains(pt.Id));
 
-                        float sphereR = isPtSel ? 0.019f : 0.014f;
+                        float sphereR = isPtSel ? 0.010f : 0.0072f;
                         Vector3 ptCol = isPtSel ? new Vector3(1.0f, 0.84f, 0.22f) : new Vector3(0.25f, 0.80f, 0.98f);
                         DrawSphere(pt.Position, sphereR, ptCol);
                     }
@@ -372,7 +404,7 @@ namespace CrimiradTailoring.Studio.Rendering
                         var sPt = src.FindPoint(conn.SourceElementId);
                         var dPt = dst.FindPoint(conn.TargetElementId);
                         if (sPt != null && dPt != null)
-                            DrawCylinderSegment(sPt.Position, dPt.Position, 0.0045f, new Vector3(0.96f, 0.75f, 0.31f));
+                            DrawCylinderSegment(sPt.Position, dPt.Position, 0.0028f, new Vector3(0.96f, 0.75f, 0.31f));
                     }
                 }
 
@@ -381,6 +413,7 @@ namespace CrimiradTailoring.Studio.Rendering
                 {
                     foreach (var cloth in cloths)
                     {
+                        if (!cloth.IsVisible) continue;
                         foreach (var edge in cloth.Edges)
                         {
                             bool isEdgeSel = (selectedEdge != null && selectedEdge.Id == edge.Id) ||
@@ -410,10 +443,49 @@ namespace CrimiradTailoring.Studio.Rendering
                 }
             }
 
-            // 4. Move Gizmo 3D (luôn nổi trên cùng để dễ nắm kéo!)
-            if (showMoveGizmo && selectedCloth != null)
+            // 3b. Điểm Origin (tâm xoay / phóng to thu nhỏ) màu cam kiểu Blender & các Cạnh Biên Vải
+            if (selectedCloth != null && selectedCloth.IsVisible && selectedCloth.Mesh.Vertices.Count > 0)
             {
-                Vec3? pivot = GetGizmoPivot(selectedCloth, selectedPoint, selectedEdge);
+                if (highlightAllBorders && selectedClothBorders != null)
+                {
+                    foreach (var border in selectedClothBorders)
+                    {
+                        bool isSel = selectedBorderEdge != null && selectedBorderEdge.Index == border.Index;
+                        if (!isSel)
+                            DrawBorderPolyline(selectedCloth.Mesh.Vertices, border, new Vector3(0.38f, 0.78f, 0.88f), 2.2f, viewProj);
+                    }
+                }
+
+                if (selectedBorderEdge != null)
+                {
+                    DrawBorderPolyline(selectedCloth.Mesh.Vertices, selectedBorderEdge, new Vector3(1.0f, 0.78f, 0.22f), 4.0f, viewProj);
+                    GL.UseProgram(_solidProgram);
+                    GL.UniformMatrix4(GL.GetUniformLocation(_solidProgram, "uViewProj"), false, ref viewProj);
+                    GL.Uniform3(GL.GetUniformLocation(_solidProgram, "uCamPos"), camPos);
+                    GL.Uniform1(GL.GetUniformLocation(_solidProgram, "uUnlit"), 1.0f);
+                    DrawSphere(selectedBorderEdge.Midpoint, 0.010f, new Vector3(1.0f, 0.80f, 0.22f));
+                }
+            }
+
+            foreach (var cloth in cloths)
+            {
+                if (!cloth.IsVisible) continue;
+                bool isSelCloth = selectedCloth != null && selectedCloth.Id == cloth.Id;
+                if ((cloth.CustomOrigin.HasValue || isSelCloth) && cloth.Mesh.Vertices.Count > 0)
+                {
+                    Vec3 origin = ClothSculptEngine.GetClothOrigin(cloth);
+                    GL.UseProgram(_solidProgram);
+                    GL.UniformMatrix4(GL.GetUniformLocation(_solidProgram, "uViewProj"), false, ref viewProj);
+                    GL.Uniform3(GL.GetUniformLocation(_solidProgram, "uCamPos"), camPos);
+                    GL.Uniform1(GL.GetUniformLocation(_solidProgram, "uUnlit"), 1.0f);
+                    DrawSphere(origin, cloth.CustomOrigin.HasValue ? 0.0095f : 0.0070f, new Vector3(1.0f, 0.56f, 0.08f));
+                }
+            }
+
+            // 4. Move Gizmo 3D (luôn nổi trên cùng để dễ nắm kéo!)
+            if (showMoveGizmo && selectedCloth != null && selectedCloth.IsVisible)
+            {
+                Vec3? pivot = GetGizmoPivot(selectedCloth, selectedPoint, selectedEdge, selectedBorderEdge);
                 if (pivot.HasValue)
                 {
                     GL.Clear(ClearBufferMask.DepthBufferBit);
@@ -425,7 +497,11 @@ namespace CrimiradTailoring.Studio.Rendering
             GL.UseProgram(0);
         }
 
-        public static Vec3? GetGizmoPivot(ClothEntity? selectedCloth, ControlPoint? selectedPoint, ControlEdge? selectedEdge)
+        public static Vec3? GetGizmoPivot(
+            ClothEntity? selectedCloth,
+            ControlPoint? selectedPoint,
+            ControlEdge? selectedEdge,
+            ClothBorderEdge? selectedBorderEdge = null)
         {
             if (selectedCloth == null) return null;
             if (selectedPoint != null) return selectedPoint.Position;
@@ -436,8 +512,10 @@ namespace CrimiradTailoring.Studio.Rendering
                 if (pA != null && pB != null)
                     return (pA.Position + pB.Position) * 0.5f;
             }
+            if (selectedBorderEdge != null)
+                return selectedBorderEdge.Midpoint;
             if (selectedCloth.Mesh.Vertices.Count > 0)
-                return ClothSculptEngine.GetClothCentroid(selectedCloth);
+                return ClothSculptEngine.GetClothOrigin(selectedCloth);
             return null;
         }
 
@@ -527,54 +605,61 @@ namespace CrimiradTailoring.Studio.Rendering
             out ControlEdge? hitEdge,
             out Vec3 hitWorldPos)
         {
+            RaycastSceneAnalytic(
+                mouseX, mouseY, viewportW, viewportH,
+                camYawDeg, camPitchDeg, camDistance, camTarget,
+                cloths, selectedCloth, selectedPoint, selectedEdge,
+                showMoveGizmo, showElements,
+                out hitGizmoAxis, out hitCloth, out hitPoint, out hitEdge, out hitWorldPos,
+                null, null, false, out _);
+        }
+
+        /// <summary>
+        /// Raycaster toán học thuần CPU tốc độ cao (<0.03ms), hoạt động chính xác cho cả chế độ Wireframe lẫn Solid (hỗ trợ cả Biên vải).
+        /// </summary>
+        public static void RaycastSceneAnalytic(
+            double mouseX,
+            double mouseY,
+            double viewportW,
+            double viewportH,
+            double camYawDeg,
+            double camPitchDeg,
+            double camDistance,
+            Vec3 camTarget,
+            List<ClothEntity> cloths,
+            ClothEntity? selectedCloth,
+            ControlPoint? selectedPoint,
+            ControlEdge? selectedEdge,
+            bool showMoveGizmo,
+            bool showElements,
+            out GizmoAxis hitGizmoAxis,
+            out ClothEntity? hitCloth,
+            out ControlPoint? hitPoint,
+            out ControlEdge? hitEdge,
+            out Vec3 hitWorldPos,
+            IReadOnlyList<ClothBorderEdge>? selectedClothBorders,
+            ClothBorderEdge? selectedBorderEdge,
+            bool allowBorderPicking,
+            out ClothBorderEdge? hitBorderEdge)
+        {
             ComputeWorldRay(mouseX, mouseY, viewportW, viewportH, camYawDeg, camPitchDeg, camDistance, camTarget, out Vec3 ro, out Vec3 rd);
 
             hitGizmoAxis = GizmoAxis.None;
             hitCloth = null;
             hitPoint = null;
             hitEdge = null;
+            hitBorderEdge = null;
             hitWorldPos = Vec3.Zero;
 
             // 1. Kiểm tra Move Gizmo trước tiên
             if (showMoveGizmo && selectedCloth != null)
             {
-                Vec3? pivot = GetGizmoPivot(selectedCloth, selectedPoint, selectedEdge);
-                if (pivot.HasValue)
+                Vec3? pivot = GetGizmoPivot(selectedCloth, selectedPoint, selectedEdge, selectedBorderEdge);
+                if (pivot.HasValue && TryHitMoveGizmo(ro, rd, pivot.Value, camDistance, out GizmoAxis gAx, out Vec3 gWorld))
                 {
-                    float arrowLen = (float)Math.Max(0.14, Math.Min(0.28, camDistance * 0.14));
-                    Vec3 p = pivot.Value;
-
-                    if (RaySphereDistance(ro, rd, p, 0.028f, out _))
-                    {
-                        hitGizmoAxis = GizmoAxis.FreeCenter;
-                        hitWorldPos = p;
-                        return;
-                    }
-
-                    float bestDist = float.MaxValue;
-                    GizmoAxis bestAx = GizmoAxis.None;
-                    Vec3 bestPos = Vec3.Zero;
-                    void TestAxis(GizmoAxis ax, Vec3 dir)
-                    {
-                        float d = RaySegmentDistance(ro, rd, p + dir * 0.02f, p + dir * arrowLen, out float tRay);
-                        if (d < 0.022f && tRay < bestDist)
-                        {
-                            bestDist = tRay;
-                            bestAx = ax;
-                            bestPos = ro + rd * tRay;
-                        }
-                    }
-
-                    TestAxis(GizmoAxis.X, Vec3.Right);
-                    TestAxis(GizmoAxis.Y, Vec3.Up);
-                    TestAxis(GizmoAxis.Z, Vec3.Forward);
-
-                    if (bestAx != GizmoAxis.None)
-                    {
-                        hitGizmoAxis = bestAx;
-                        hitWorldPos = bestPos;
-                        return;
-                    }
+                    hitGizmoAxis = gAx;
+                    hitWorldPos = gWorld;
+                    return;
                 }
             }
 
@@ -584,9 +669,10 @@ namespace CrimiradTailoring.Studio.Rendering
             {
                 foreach (var cloth in cloths)
                 {
+                    if (!cloth.IsVisible) continue;
                     foreach (var pt in cloth.Points)
                     {
-                        if (RaySphereDistance(ro, rd, pt.Position, 0.028f, out float tHit) && tHit < bestElemT)
+                        if (RaySphereDistance(ro, rd, pt.Position, 0.020f, out float tHit) && tHit < bestElemT)
                         {
                             bestElemT = tHit;
                             hitCloth = cloth;
@@ -605,7 +691,7 @@ namespace CrimiradTailoring.Studio.Rendering
                             if (pA == null || pB == null) continue;
 
                             float dist = RaySegmentDistance(ro, rd, pA.Position, pB.Position, out float tHit);
-                            if (dist < 0.016f && tHit < bestElemT)
+                            if (dist < 0.012f && tHit < bestElemT)
                             {
                                 bestElemT = tHit;
                                 hitCloth = cloth;
@@ -620,12 +706,52 @@ namespace CrimiradTailoring.Studio.Rendering
             if (hitPoint != null || hitEdge != null)
                 return;
 
-            // 3. Mặt vải (Möller–Trumbore)
+            // 2b. Cạnh Biên Vải (MeshEdge) trên tất cả mảnh vải đang hiển thị
+            if (allowBorderPicking)
+            {
+                float bestBorderT = float.MaxValue;
+                foreach (var cloth in cloths)
+                {
+                    if (!cloth.IsVisible) continue;
+                    var borders = (cloth == selectedCloth && selectedClothBorders != null && selectedClothBorders.Count > 0)
+                        ? selectedClothBorders
+                        : (cloth.CachedBorders ??= ClothSculptEngine.DetectClothBorderEdges(cloth));
+                    if (borders == null || borders.Count == 0) continue;
+
+                    var cVerts = cloth.Mesh.Vertices;
+                    foreach (var border in borders)
+                    {
+                        var chain = border.VertexIndices;
+                        int segCount = border.IsClosedLoop ? chain.Count : (chain.Count - 1);
+                        for (int s = 0; s < segCount; s++)
+                        {
+                            int ia = chain[s];
+                            int ib = chain[(s + 1) % chain.Count];
+                            if (ia < 0 || ib < 0 || ia >= cVerts.Count || ib >= cVerts.Count) continue;
+                            float dSeg = RaySegmentDistance(ro, rd, cVerts[ia], cVerts[ib], out float tHit);
+                            if (dSeg < 0.015f && tHit < bestBorderT)
+                            {
+                                bestBorderT = tHit;
+                                hitCloth = cloth;
+                                hitBorderEdge = border;
+                                hitWorldPos = ro + rd * tHit;
+                            }
+                        }
+                    }
+                }
+                if (hitBorderEdge != null)
+                    return;
+            }
+
+            // 3. Mặt vải (dùng lưới gốc khi mật độ hiển thị cao > 6000 tris để pick cực nhanh + không tốn CPU)
             float bestClothT = float.MaxValue;
             foreach (var cloth in cloths)
             {
-                var verts = cloth.Mesh.Vertices;
-                var tris = cloth.Mesh.Triangles;
+                if (!cloth.IsVisible) continue;
+                var dispMesh = cloth.RenderSubdividedMesh ?? cloth.Mesh;
+                var pickMesh = dispMesh.Triangles.Count > 6000 ? cloth.Mesh : dispMesh;
+                var verts = pickMesh.Vertices;
+                var tris = pickMesh.Triangles;
                 int triCount = tris.Count / 3;
 
                 for (int t = 0; t < triCount; t++)
@@ -730,7 +856,7 @@ namespace CrimiradTailoring.Studio.Rendering
 
         private void UploadClothMeshAndWireToGpu(ClothEntity cloth, ClothGpuCache cache)
         {
-            var data = cloth.Mesh;
+            var data = cloth.RenderSubdividedMesh ?? cloth.Mesh;
             if (data.Vertices.Count == 0 || data.Triangles.Count < 3)
             {
                 cache.UnselectedIndexCount = 0;
@@ -755,13 +881,18 @@ namespace CrimiradTailoring.Studio.Rendering
             int triCount = data.Triangles.Count / 3;
             Vec3[]? unitTriNormals = null;
             Vec3[]? rawTriNormals = null;
-            List<int>[]? vertToTris = null;
+            int[][]? vertToTrisFlat = null;
             float cosThreshold = (float)Math.Cos(cloth.AutoSmoothAngleDeg * Math.PI / 180.0);
 
             if (!useSharedVertices)
             {
-                rawTriNormals = new Vec3[triCount];
-                unitTriNormals = new Vec3[triCount];
+                if (cache.RawTriNormalsScratch == null || cache.RawTriNormalsScratch.Length != triCount)
+                    cache.RawTriNormalsScratch = new Vec3[triCount];
+                if (cache.UnitTriNormalsScratch == null || cache.UnitTriNormalsScratch.Length != triCount)
+                    cache.UnitTriNormalsScratch = new Vec3[triCount];
+                rawTriNormals = cache.RawTriNormalsScratch;
+                unitTriNormals = cache.UnitTriNormalsScratch;
+
                 for (int t = 0; t < triCount; t++)
                 {
                     Vec3 v0 = data.Vertices[data.Triangles[t * 3]];
@@ -774,41 +905,55 @@ namespace CrimiradTailoring.Studio.Rendering
 
                 if (data.TriangleToFace != null && data.TriangleToFace.Count == triCount && data.Faces != null && data.Faces.Count > 0)
                 {
-                    var faceNormSum = new Vec3[data.Faces.Count];
+                    int fCount = data.Faces.Count;
+                    if (cache.FaceNormSumScratch == null || cache.FaceNormSumScratch.Length != fCount)
+                        cache.FaceNormSumScratch = new Vec3[fCount];
+                    else
+                        Array.Clear(cache.FaceNormSumScratch, 0, fCount);
+                    var faceNormSum = cache.FaceNormSumScratch;
+
                     for (int t = 0; t < triCount; t++)
                     {
                         int fIdx = data.TriangleToFace[t];
-                        if (fIdx >= 0 && fIdx < faceNormSum.Length)
+                        if (fIdx >= 0 && fIdx < fCount)
                             faceNormSum[fIdx] = faceNormSum[fIdx] + rawTriNormals[t];
                     }
                     for (int t = 0; t < triCount; t++)
                     {
                         int fIdx = data.TriangleToFace[t];
-                        if (fIdx >= 0 && fIdx < faceNormSum.Length && faceNormSum[fIdx].LengthSquared > 1e-10f)
+                        if (fIdx >= 0 && fIdx < fCount && faceNormSum[fIdx].LengthSquared > 1e-10f)
                             unitTriNormals[t] = faceNormSum[fIdx].Normalized;
                     }
                 }
 
                 if (cloth.SmoothMode == MeshShadingSmoothMode.AutoSmooth)
                 {
-                    vertToTris = new List<int>[data.Vertices.Count];
-                    for (int t = 0; t < triCount; t++)
+                    if (!cache.VertToTrisValid || cache.VertToTrisFlat == null || cache.VertToTrisFlat.Length != data.Vertices.Count)
                     {
-                        for (int k = 0; k < 3; k++)
+                        var tmp = new List<int>[data.Vertices.Count];
+                        for (int t = 0; t < triCount; t++)
                         {
-                            int vi = data.Triangles[t * 3 + k];
-                            vertToTris[vi] ??= new List<int>(6);
-                            vertToTris[vi].Add(t);
+                            for (int k = 0; k < 3; k++)
+                            {
+                                int vi = data.Triangles[t * 3 + k];
+                                tmp[vi] ??= new List<int>(6);
+                                tmp[vi].Add(t);
+                            }
                         }
+                        cache.VertToTrisFlat = new int[data.Vertices.Count][];
+                        for (int v = 0; v < data.Vertices.Count; v++)
+                            cache.VertToTrisFlat[v] = tmp[v] != null ? tmp[v].ToArray() : Array.Empty<int>();
+                        cache.VertToTrisValid = true;
                     }
+                    vertToTrisFlat = cache.VertToTrisFlat;
 
                     bool hasCrease = false;
-                    for (int v = 0; v < vertToTris.Length && !hasCrease; v++)
+                    for (int v = 0; v < vertToTrisFlat.Length && !hasCrease; v++)
                     {
-                        var adj = vertToTris[v];
-                        if (adj == null || adj.Count <= 1) continue;
+                        int[] adj = vertToTrisFlat[v];
+                        if (adj.Length <= 1) continue;
                         Vec3 refN = unitTriNormals[adj[0]];
-                        for (int i = 1; i < adj.Count; i++)
+                        for (int i = 1; i < adj.Length; i++)
                         {
                             if (Vec3.Dot(refN, unitTriNormals[adj[i]]) < cosThreshold)
                             {
@@ -822,11 +967,14 @@ namespace CrimiradTailoring.Studio.Rendering
                 }
             }
 
-            float[] vboData;
+            int neededFloats = useSharedVertices ? data.Vertices.Count * 8 : triCount * 3 * 8;
+            if (cache.VboScratch == null || cache.VboScratch.Length != neededFloats)
+                cache.VboScratch = new float[neededFloats];
+            float[] vboData = cache.VboScratch;
+
             if (useSharedVertices)
             {
                 int vc = data.Vertices.Count;
-                vboData = new float[vc * 8];
                 for (int i = 0; i < vc; i++)
                 {
                     Vec3 p = data.Vertices[i];
@@ -842,8 +990,8 @@ namespace CrimiradTailoring.Studio.Rendering
             else
             {
                 int cornerCount = triCount * 3;
-                vboData = new float[cornerCount * 8];
-                cache.TriCornerMap = new int[cornerCount];
+                if (cache.TriCornerMap == null || cache.TriCornerMap.Length != cornerCount)
+                    cache.TriCornerMap = new int[cornerCount];
 
                 for (int t = 0; t < triCount; t++)
                 {
@@ -856,11 +1004,11 @@ namespace CrimiradTailoring.Studio.Rendering
                         Vec2 uv = vIdx < data.UVs.Count ? data.UVs[vIdx] : new Vec2(0.5f, 0.5f);
 
                         Vec3 finalN = baseNorm;
-                        if (cloth.SmoothMode == MeshShadingSmoothMode.AutoSmooth && vertToTris != null && vertToTris[vIdx] != null)
+                        if (cloth.SmoothMode == MeshShadingSmoothMode.AutoSmooth && vertToTrisFlat != null)
                         {
                             Vec3 sum = Vec3.Zero;
-                            var adj = vertToTris[vIdx];
-                            for (int a = 0; a < adj.Count; a++)
+                            int[] adj = vertToTrisFlat[vIdx];
+                            for (int a = 0; a < adj.Length; a++)
                             {
                                 int adjT = adj[a];
                                 if (Vec3.Dot(baseNorm, unitTriNormals[adjT]) >= cosThreshold)
@@ -881,7 +1029,7 @@ namespace CrimiradTailoring.Studio.Rendering
 
             GL.BindVertexArray(cache.Vao);
             GL.BindBuffer(BufferTarget.ArrayBuffer, cache.Vbo);
-            GL.BufferData(BufferTarget.ArrayBuffer, vboData.Length * sizeof(float), vboData, BufferUsageHint.DynamicDraw);
+            GL.BufferData(BufferTarget.ArrayBuffer, vboData.Length * sizeof(float), vboData, BufferUsageHint.StreamDraw);
 
             int stride = 8 * sizeof(float);
             GL.EnableVertexAttribArray(0);
@@ -891,9 +1039,33 @@ namespace CrimiradTailoring.Studio.Rendering
             GL.EnableVertexAttribArray(2);
             GL.VertexAttribPointer(2, 2, VertexAttribPointerType.Float, false, stride, 6 * sizeof(float));
 
-            // Upload Wireframe VBO (pos only) & EBO (các cạnh Quad chuẩn Blender)
+            bool topologyChanged = cache.BuiltVertCount != data.Vertices.Count ||
+                                   cache.BuiltTriCount != triCount ||
+                                   cache.BuiltSubdivLevel != cloth.SubdivisionLevel ||
+                                   cache.BuiltUsedSharedVertices != useSharedVertices ||
+                                   !cache.SelectionEboValid;
+
+            cache.BuiltSmoothMode = cloth.SmoothMode;
+            cache.BuiltAutoSmoothDeg = cloth.AutoSmoothAngleDeg;
+            cache.BuiltVertCount = data.Vertices.Count;
+            cache.BuiltTriCount = triCount;
+            cache.BuiltSubdivLevel = cloth.SubdivisionLevel;
+            cache.BuiltUsedSharedVertices = useSharedVertices;
+            cache.MeshDirty = false;
+            if (topologyChanged)
+                cache.SelectionDirty = true;
+        }
+
+        private static void UploadClothWireToGpu(ClothEntity cloth, ClothGpuCache cache)
+        {
+            var data = cloth.RenderSubdividedMesh ?? cloth.Mesh;
             int vCount = data.Vertices.Count;
-            var wirePos = new float[vCount * 3];
+            int triCount = data.Triangles.Count / 3;
+            if (vCount == 0) { cache.WireIndexCount = 0; cache.WireDirty = false; return; }
+
+            if (cache.WireScratch == null || cache.WireScratch.Length != vCount * 3)
+                cache.WireScratch = new float[vCount * 3];
+            float[] wirePos = cache.WireScratch;
             for (int i = 0; i < vCount; i++)
             {
                 Vec3 p = data.Vertices[i];
@@ -902,54 +1074,63 @@ namespace CrimiradTailoring.Studio.Rendering
                 wirePos[i * 3 + 2] = p.Z;
             }
 
-            var drawnEdges = new HashSet<long>();
-            var wireIndices = new List<uint>(vCount * 4);
-            void AddEdge(int a, int b)
-            {
-                int min = Math.Min(a, b);
-                int max = Math.Max(a, b);
-                long key = ((long)min << 32) | (uint)max;
-                if (drawnEdges.Add(key))
-                {
-                    wireIndices.Add((uint)a);
-                    wireIndices.Add((uint)b);
-                }
-            }
-
-            if (data.Faces != null && data.Faces.Count > 0)
-            {
-                for (int f = 0; f < data.Faces.Count; f++)
-                {
-                    var face = data.Faces[f];
-                    if (face == null || face.Count < 3) continue;
-                    for (int k = 0; k < face.Count; k++)
-                        AddEdge(face[k], face[(k + 1) % face.Count]);
-                }
-            }
-            else
-            {
-                for (int t = 0; t < triCount; t++)
-                {
-                    int i0 = data.Triangles[t * 3];
-                    int i1 = data.Triangles[t * 3 + 1];
-                    int i2 = data.Triangles[t * 3 + 2];
-                    AddEdge(i0, i1); AddEdge(i1, i2); AddEdge(i2, i0);
-                }
-            }
-
-            var wireIdxArr = wireIndices.ToArray();
-            cache.WireIndexCount = wireIdxArr.Length;
-
             GL.BindVertexArray(cache.WireVao);
             GL.BindBuffer(BufferTarget.ArrayBuffer, cache.WireVbo);
-            GL.BufferData(BufferTarget.ArrayBuffer, wirePos.Length * sizeof(float), wirePos, BufferUsageHint.DynamicDraw);
+            GL.BufferData(BufferTarget.ArrayBuffer, wirePos.Length * sizeof(float), wirePos, BufferUsageHint.StreamDraw);
             GL.EnableVertexAttribArray(0);
             GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), 0);
-            GL.BindBuffer(BufferTarget.ElementArrayBuffer, cache.WireEbo);
-            GL.BufferData(BufferTarget.ElementArrayBuffer, wireIdxArr.Length * sizeof(uint), wireIdxArr, BufferUsageHint.DynamicDraw);
 
-            // Upload Normals lines
-            var normLines = new List<float>(vCount * 3);
+            if (!cache.WireEboValid)
+            {
+                var drawnEdges = new HashSet<long>();
+                var wireIndices = new List<uint>(vCount * 4);
+                void AddEdge(int a, int b)
+                {
+                    int min = Math.Min(a, b);
+                    int max = Math.Max(a, b);
+                    long key = ((long)min << 32) | (uint)max;
+                    if (drawnEdges.Add(key))
+                    {
+                        wireIndices.Add((uint)a);
+                        wireIndices.Add((uint)b);
+                    }
+                }
+
+                if (data.Faces != null && data.Faces.Count > 0)
+                {
+                    for (int f = 0; f < data.Faces.Count; f++)
+                    {
+                        var face = data.Faces[f];
+                        if (face == null || face.Count < 3) continue;
+                        for (int k = 0; k < face.Count; k++)
+                            AddEdge(face[k], face[(k + 1) % face.Count]);
+                    }
+                }
+                else
+                {
+                    for (int t = 0; t < triCount; t++)
+                    {
+                        int i0 = data.Triangles[t * 3];
+                        int i1 = data.Triangles[t * 3 + 1];
+                        int i2 = data.Triangles[t * 3 + 2];
+                        AddEdge(i0, i1); AddEdge(i1, i2); AddEdge(i2, i0);
+                    }
+                }
+
+                var wireIdxArr = wireIndices.ToArray();
+                cache.WireIndexCount = wireIdxArr.Length;
+                GL.BindBuffer(BufferTarget.ElementArrayBuffer, cache.WireEbo);
+                GL.BufferData(BufferTarget.ElementArrayBuffer, wireIdxArr.Length * sizeof(uint), wireIdxArr, BufferUsageHint.DynamicDraw);
+                cache.WireEboValid = true;
+            }
+
+            cache.WireDirty = false;
+        }
+
+        private static void UploadClothNormalsToGpu(ClothEntity cloth, ClothGpuCache cache)
+        {
+            var data = cloth.RenderSubdividedMesh ?? cloth.Mesh;
+            var normLines = new List<float>(data.Vertices.Count * 3);
             for (int i = 0; i < data.Vertices.Count && i < data.Normals.Count; i += 2)
             {
                 Vec3 p0 = data.Vertices[i];
@@ -961,28 +1142,41 @@ namespace CrimiradTailoring.Studio.Rendering
             cache.NormalsVertexCount = normArr.Length / 3;
             GL.BindVertexArray(cache.NormalsVao);
             GL.BindBuffer(BufferTarget.ArrayBuffer, cache.NormalsVbo);
-            GL.BufferData(BufferTarget.ArrayBuffer, normArr.Length * sizeof(float), normArr, BufferUsageHint.DynamicDraw);
+            GL.BufferData(BufferTarget.ArrayBuffer, normArr.Length * sizeof(float), normArr, BufferUsageHint.StreamDraw);
             GL.EnableVertexAttribArray(0);
             GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), 0);
-
-            cache.BuiltSmoothMode = cloth.SmoothMode;
-            cache.BuiltAutoSmoothDeg = cloth.AutoSmoothAngleDeg;
-            cache.MeshDirty = false;
-            cache.SelectionDirty = true;
+            cache.NormalsDirty = false;
         }
 
         private static void UploadClothSelectionIndicesToGpu(ClothEntity cloth, ClothGpuCache cache)
         {
-            var tris = cloth.Mesh.Triangles;
+            var data = cloth.RenderSubdividedMesh ?? cloth.Mesh;
+            var tris = data.Triangles;
             int triCount = tris.Count / 3;
-            bool hasSel = cloth.SelectedTriangles != null && cloth.SelectedTriangles.Count > 0;
+            bool hasSubdiv = cloth.RenderSubdividedMesh != null && data.SubdivParentFaces != null;
+            bool hasFaceSel = cloth.SelectedFaces != null && cloth.SelectedFaces.Count > 0;
+            bool hasTriSel = cloth.SelectedTriangles != null && cloth.SelectedTriangles.Count > 0;
 
             var unSel = new List<uint>(triCount * 3);
-            var sel = hasSel ? new List<uint>(cloth.SelectedTriangles!.Count * 3) : null;
+            var sel = (hasFaceSel || hasTriSel) ? new List<uint>(triCount) : null;
 
             for (int t = 0; t < triCount; t++)
             {
-                bool isSel = hasSel && cloth.SelectedTriangles!.Contains(t);
+                bool isSel = false;
+                if (hasSubdiv)
+                {
+                    if (hasFaceSel && data.TriangleToFace != null && t < data.TriangleToFace.Count)
+                    {
+                        int subFace = data.TriangleToFace[t];
+                        if (subFace >= 0 && subFace < data.SubdivParentFaces!.Length)
+                            isSel = cloth.SelectedFaces!.Contains(data.SubdivParentFaces[subFace]);
+                    }
+                }
+                else
+                {
+                    isSel = hasTriSel && cloth.SelectedTriangles!.Contains(t);
+                }
+
                 var dst = isSel ? sel! : unSel;
                 if (cache.TriCornerMap == null)
                 {
@@ -1016,6 +1210,47 @@ namespace CrimiradTailoring.Studio.Rendering
             }
 
             cache.SelectionDirty = false;
+            cache.SelectionEboValid = true;
+        }
+
+        public static bool TryHitMoveGizmo(Vec3 ro, Vec3 rd, Vec3 p, double camDistance, out GizmoAxis hitAxis, out Vec3 hitWorldPos)
+        {
+            hitAxis = GizmoAxis.None;
+            hitWorldPos = Vec3.Zero;
+            float arrowLen = (float)Math.Max(0.14, Math.Min(0.28, camDistance * 0.14));
+
+            if (RaySphereDistance(ro, rd, p, 0.028f, out _))
+            {
+                hitAxis = GizmoAxis.FreeCenter;
+                hitWorldPos = p;
+                return true;
+            }
+
+            float bestDist = float.MaxValue;
+            GizmoAxis bestAx = GizmoAxis.None;
+            Vec3 bestPos = Vec3.Zero;
+            void TestAxis(GizmoAxis ax, Vec3 dir)
+            {
+                float d = RaySegmentDistance(ro, rd, p + dir * 0.02f, p + dir * arrowLen, out float tRay);
+                if (d < 0.022f && tRay < bestDist)
+                {
+                    bestDist = tRay;
+                    bestAx = ax;
+                    bestPos = ro + rd * tRay;
+                }
+            }
+
+            TestAxis(GizmoAxis.X, Vec3.Right);
+            TestAxis(GizmoAxis.Y, Vec3.Up);
+            TestAxis(GizmoAxis.Z, Vec3.Forward);
+
+            if (bestAx != GizmoAxis.None)
+            {
+                hitAxis = bestAx;
+                hitWorldPos = bestPos;
+                return true;
+            }
+            return false;
         }
 
         private void DrawSphere(Vec3 center, float radius, Vector3 color)
@@ -1151,6 +1386,35 @@ namespace CrimiradTailoring.Studio.Rendering
             GL.EnableVertexAttribArray(0);
             GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), 0);
             GL.DrawArrays(PrimitiveType.LineLoop, 0, pts.Count);
+        }
+
+        private void DrawBorderPolyline(IReadOnlyList<Vec3> verts, ClothBorderEdge border, Vector3 color, float lineWidth, Matrix4 viewProj)
+        {
+            var chain = border.VertexIndices;
+            if (chain.Count < 2) return;
+            var arr = new float[chain.Count * 3];
+            for (int i = 0; i < chain.Count; i++)
+            {
+                int vi = chain[i];
+                if (vi < 0 || vi >= verts.Count) return;
+                arr[i * 3 + 0] = verts[vi].X;
+                arr[i * 3 + 1] = verts[vi].Y;
+                arr[i * 3 + 2] = verts[vi].Z;
+            }
+
+            GL.UseProgram(_lineProgram);
+            GL.UniformMatrix4(GL.GetUniformLocation(_lineProgram, "uViewProj"), false, ref viewProj);
+            GL.Uniform1(GL.GetUniformLocation(_lineProgram, "uDepthBias"), -0.0012f);
+            GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), color);
+            GL.LineWidth(lineWidth);
+
+            GL.BindVertexArray(_dynamicOutlineVao);
+            GL.BindBuffer(BufferTarget.ArrayBuffer, _dynamicOutlineVbo);
+            GL.BufferData(BufferTarget.ArrayBuffer, arr.Length * sizeof(float), arr, BufferUsageHint.StreamDraw);
+            GL.EnableVertexAttribArray(0);
+            GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), 0);
+            GL.DrawArrays(border.IsClosedLoop ? PrimitiveType.LineLoop : PrimitiveType.LineStrip, 0, chain.Count);
+            GL.LineWidth(1.0f);
         }
 
         private static Matrix4 RotationFromUpTo(Vector3 targetDir)
@@ -1502,6 +1766,27 @@ void main() { FragColor = vec4(uColor, 1.0); }";
             _unitRingVao = UploadLineBuffer(pts, out _unitRingVbo);
         }
 
+        private void DrawFloorGridAndAxes(Matrix4 viewProj)
+        {
+            GL.UseProgram(_lineProgram);
+            GL.UniformMatrix4(GL.GetUniformLocation(_lineProgram, "uViewProj"), false, ref viewProj);
+            GL.Uniform1(GL.GetUniformLocation(_lineProgram, "uDepthBias"), 0f);
+            GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.26f, 0.26f, 0.28f));
+            GL.LineWidth(1.0f);
+            GL.BindVertexArray(_floorGridVao);
+            GL.DrawArrays(PrimitiveType.Lines, 0, _floorGridCount);
+
+            GL.LineWidth(2.0f);
+            GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.84f, 0.28f, 0.31f));
+            GL.BindVertexArray(_axisXVao);
+            GL.DrawArrays(PrimitiveType.Lines, 0, 2);
+
+            GL.Uniform3(GL.GetUniformLocation(_lineProgram, "uColor"), new Vector3(0.28f, 0.65f, 0.43f));
+            GL.BindVertexArray(_axisZVao);
+            GL.DrawArrays(PrimitiveType.Lines, 0, 2);
+            GL.LineWidth(1.0f);
+        }
+
         private static void UploadSolidVao(float[] verts, uint[] indices, out int vao, out int vbo, out int ebo, out int idxCount)
         {
             vao = GL.GenVertexArray();
@@ -1532,6 +1817,7 @@ void main() { FragColor = vec4(uColor, 1.0); }";
             foreach (var c in _clothCaches.Values)
                 c.Dispose();
             _clothCaches.Clear();
+            DisposeCharacterResources();
 
             if (_initialized)
             {

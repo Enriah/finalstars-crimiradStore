@@ -183,6 +183,12 @@ namespace CrimiradTailoring.Core.Models
         /// </summary>
         public List<int> TriangleToFace { get; set; } = new List<int>();
 
+        /// <summary>
+        /// Ánh xạ mặt con (nếu lưới được chia mịn Catmull-Clark) về chỉ số mặt gốc ban đầu để giữ vùng chọn.
+        /// </summary>
+        [NonSerialized]
+        public int[]? SubdivParentFaces;
+
         public void RebuildTrianglesFromFaces()
         {
             Triangles.Clear();

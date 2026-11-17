@@ -82,26 +82,26 @@ namespace CrimiradTailoring.Studio.Rendering
             style.FrameBorderSize = 1.0f;
 
             var c = style.Colors;
-            c[(int)ImGuiCol.Text] = new System.Numerics.Vector4(0.93f, 0.94f, 0.96f, 1.0f);
-            c[(int)ImGuiCol.TextDisabled] = new System.Numerics.Vector4(0.55f, 0.60f, 0.72f, 1.0f);
-            c[(int)ImGuiCol.WindowBg] = new System.Numerics.Vector4(0.09f, 0.106f, 0.149f, 0.88f);
-            c[(int)ImGuiCol.ChildBg] = new System.Numerics.Vector4(0.067f, 0.078f, 0.114f, 0.92f);
-            c[(int)ImGuiCol.PopupBg] = new System.Numerics.Vector4(0.10f, 0.12f, 0.17f, 0.97f);
-            c[(int)ImGuiCol.Border] = new System.Numerics.Vector4(0.20f, 0.24f, 0.34f, 0.90f);
-            c[(int)ImGuiCol.FrameBg] = new System.Numerics.Vector4(0.11f, 0.13f, 0.19f, 1.0f);
-            c[(int)ImGuiCol.FrameBgHovered] = new System.Numerics.Vector4(0.17f, 0.21f, 0.30f, 1.0f);
-            c[(int)ImGuiCol.FrameBgActive] = new System.Numerics.Vector4(0.22f, 0.28f, 0.40f, 1.0f);
-            c[(int)ImGuiCol.MenuBarBg] = new System.Numerics.Vector4(0.086f, 0.102f, 0.141f, 0.98f);
-            c[(int)ImGuiCol.Button] = new System.Numerics.Vector4(0.14f, 0.16f, 0.22f, 1.0f);
-            c[(int)ImGuiCol.ButtonHovered] = new System.Numerics.Vector4(0.20f, 0.24f, 0.34f, 1.0f);
-            c[(int)ImGuiCol.ButtonActive] = new System.Numerics.Vector4(0.18f, 0.42f, 0.90f, 1.0f);
-            c[(int)ImGuiCol.Header] = new System.Numerics.Vector4(0.18f, 0.42f, 0.90f, 0.75f);
-            c[(int)ImGuiCol.HeaderHovered] = new System.Numerics.Vector4(0.24f, 0.48f, 0.94f, 0.90f);
-            c[(int)ImGuiCol.HeaderActive] = new System.Numerics.Vector4(0.18f, 0.42f, 0.90f, 1.0f);
-            c[(int)ImGuiCol.SliderGrab] = new System.Numerics.Vector4(0.53f, 0.75f, 0.82f, 1.0f);
-            c[(int)ImGuiCol.SliderGrabActive] = new System.Numerics.Vector4(0.32f, 0.55f, 1.0f, 1.0f);
-            c[(int)ImGuiCol.CheckMark] = new System.Numerics.Vector4(0.53f, 0.75f, 0.82f, 1.0f);
-            c[(int)ImGuiCol.Separator] = new System.Numerics.Vector4(0.19f, 0.23f, 0.33f, 1.0f);
+            c[(int)ImGuiCol.Text] = new System.Numerics.Vector4(0.90f, 0.90f, 0.91f, 1.0f);
+            c[(int)ImGuiCol.TextDisabled] = new System.Numerics.Vector4(0.52f, 0.52f, 0.54f, 1.0f);
+            c[(int)ImGuiCol.WindowBg] = new System.Numerics.Vector4(0.145f, 0.145f, 0.150f, 0.94f);
+            c[(int)ImGuiCol.ChildBg] = new System.Numerics.Vector4(0.118f, 0.118f, 0.122f, 0.96f);
+            c[(int)ImGuiCol.PopupBg] = new System.Numerics.Vector4(0.135f, 0.135f, 0.140f, 0.98f);
+            c[(int)ImGuiCol.Border] = new System.Numerics.Vector4(0.24f, 0.24f, 0.25f, 0.95f);
+            c[(int)ImGuiCol.FrameBg] = new System.Numerics.Vector4(0.20f, 0.20f, 0.21f, 1.0f);
+            c[(int)ImGuiCol.FrameBgHovered] = new System.Numerics.Vector4(0.27f, 0.27f, 0.28f, 1.0f);
+            c[(int)ImGuiCol.FrameBgActive] = new System.Numerics.Vector4(0.33f, 0.33f, 0.35f, 1.0f);
+            c[(int)ImGuiCol.MenuBarBg] = new System.Numerics.Vector4(0.114f, 0.114f, 0.118f, 0.98f);
+            c[(int)ImGuiCol.Button] = new System.Numerics.Vector4(0.22f, 0.22f, 0.23f, 1.0f);
+            c[(int)ImGuiCol.ButtonHovered] = new System.Numerics.Vector4(0.30f, 0.30f, 0.32f, 1.0f);
+            c[(int)ImGuiCol.ButtonActive] = new System.Numerics.Vector4(0.38f, 0.38f, 0.40f, 1.0f);
+            c[(int)ImGuiCol.Header] = new System.Numerics.Vector4(0.24f, 0.24f, 0.25f, 0.95f);
+            c[(int)ImGuiCol.HeaderHovered] = new System.Numerics.Vector4(0.31f, 0.31f, 0.33f, 1.0f);
+            c[(int)ImGuiCol.HeaderActive] = new System.Numerics.Vector4(0.36f, 0.36f, 0.38f, 1.0f);
+            c[(int)ImGuiCol.SliderGrab] = new System.Numerics.Vector4(0.58f, 0.58f, 0.60f, 1.0f);
+            c[(int)ImGuiCol.SliderGrabActive] = new System.Numerics.Vector4(0.76f, 0.76f, 0.78f, 1.0f);
+            c[(int)ImGuiCol.CheckMark] = new System.Numerics.Vector4(0.86f, 0.86f, 0.88f, 1.0f);
+            c[(int)ImGuiCol.Separator] = new System.Numerics.Vector4(0.22f, 0.22f, 0.23f, 1.0f);
         }
 
         private void CreateDeviceResources()
@@ -278,6 +278,7 @@ void main()
             ImDrawDataPtr drawData = ImGui.GetDrawData();
             if (drawData.CmdListsCount == 0) return;
 
+            GL.Viewport(0, 0, Math.Max(1, _width), Math.Max(1, _height));
             GL.Enable(EnableCap.Blend);
             GL.BlendEquation(BlendEquationMode.FuncAdd);
             GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);

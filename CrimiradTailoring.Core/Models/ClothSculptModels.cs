@@ -11,7 +11,8 @@ namespace CrimiradTailoring.Core.Models
         Rotate,
         Cut,
         Scale,
-        Connect
+        Connect,
+        Ruler
     }
 
     public enum SelectTargetFilter
@@ -19,7 +20,8 @@ namespace CrimiradTailoring.Core.Models
         Region,
         ClothObject,
         Point,
-        Edge
+        Edge,
+        BorderEdge
     }
 
     public enum RegionShapeMode
@@ -87,6 +89,9 @@ namespace CrimiradTailoring.Core.Models
 
         /// <summary>Độ uốn [0..1]: 0 = Gập nhọn chữ V, 1 = Uốn cong mượt chữ U/S</summary>
         public float Bending { get; set; } = 0.65f;
+
+        /// <summary>Đánh dấu điểm đã từng được người dùng kéo hoặc chỉnh thông số để tái tạo biến dạng không phá hủy</summary>
+        public bool IsEdited { get; set; } = false;
     }
 
     /// <summary>
@@ -106,6 +111,9 @@ namespace CrimiradTailoring.Core.Models
 
         /// <summary>Độ uốn [0..1]: 0 = Nếp gập sắc chữ V, 1 = Uốn cong tròn mượt</summary>
         public float Bending { get; set; } = 0.70f;
+
+        /// <summary>Đánh dấu cạnh đã từng được người dùng kéo hoặc chỉnh thông số để tái tạo biến dạng không phá hủy</summary>
+        public bool IsEdited { get; set; } = false;
     }
 
     /// <summary>
@@ -141,10 +149,41 @@ namespace CrimiradTailoring.Core.Models
         public float RotXDeg { get; set; } = 0.0f;
         public float RotYDeg { get; set; } = 0.0f;
         public float RotZDeg { get; set; } = 0.0f;
+        public Vec3? CustomOrigin { get; set; }
         public MeshShadingSmoothMode SmoothMode { get; set; } = MeshShadingSmoothMode.AutoSmooth;
         public float AutoSmoothAngleDeg { get; set; } = 30f;
 
+        /// <summary>Ẩn / hiện mảnh vải trong Viewport (nút con mắt trong Outliner)</summary>
+        public bool IsVisible { get; set; } = true;
+
+        /// <summary>Mức độ chia mịn bề mặt cong (Catmull-Clark): 0 = Gốc, 1 = Mịn 4x, 2 = Siêu mịn 16x</summary>
+        public int SubdivisionLevel { get; set; } = 1;
+
+        /// <summary>Bật/tắt tự động dàn đều ô lưới theo tiếp tuyến bề mặt khi uốn mạnh (bảo toàn độ cao & dáng nếp)</summary>
+        public bool EqualizeGridOnBend { get; set; } = true;
+
+        /// <summary>Trạng thái gắn & ướm dáng của mảnh vải này trong CharacterViewport (liên kết 1-1)</summary>
+        public ClothCharacterAttachment CharacterState { get; set; } = new ClothCharacterAttachment();
+
         public MeshData Mesh { get; set; } = new MeshData();
+
+        [NonSerialized]
+        public MeshData? RenderSubdividedMesh;
+
+        [NonSerialized]
+        public MeshData? CharacterFittedMesh;
+
+        [NonSerialized]
+        public bool[]? CharacterOccludedTriangles;
+
+        [NonSerialized]
+        public int VisibleCharacterTriangleCount;
+
+        [NonSerialized]
+        public SubdivTopologyCache? SubdivCache;
+
+        [NonSerialized]
+        public List<ClothBorderEdge>? CachedBorders;
         public List<ControlPoint> Points { get; set; } = new List<ControlPoint>();
         public List<ControlEdge> Edges { get; set; } = new List<ControlEdge>();
 
@@ -177,5 +216,37 @@ namespace CrimiradTailoring.Core.Models
                 if (Edges[i].Id == edgeId) return Edges[i];
             return null;
         }
+    }
+
+    /// <summary>
+    /// Một cạnh biên (perimeter edge chain) thực tế của lưới vải (khác với ControlEdge uốn nếp).
+    /// Dùng để biến dạng hình dáng tổng thể tấm vải (tạo hình thang, uốn cong cung tròn làm nón cụt...).
+    /// </summary>
+    public sealed class ClothBorderEdge
+    {
+        public int Index { get; set; }
+        public string Name { get; set; } = "Biên #1";
+        public int LoopId { get; set; }
+        public bool IsClosedLoop { get; set; }
+        public List<int> VertexIndices { get; set; } = new List<int>();
+        public Vec3 Midpoint { get; set; }
+        public float ChordLength { get; set; }
+        public float ArcLength { get; set; }
+    }
+
+    /// <summary>
+    /// Bộ nhớ đệm cấu trúc chia mịn Catmull-Clark & đồ thị đỉnh kề để tái sử dụng không cấp phát lại bộ nhớ khi kéo chuột.
+    /// </summary>
+    public sealed class SubdivTopologyCache
+    {
+        public int Level;
+        public int BaseVertCount;
+        public int BaseFaceCount;
+        public float RestChecksum;
+        public MeshData TemplateMesh = new MeshData();
+        public int[][] Adjacency = Array.Empty<int[]>();
+        public bool[] IsBoundary = Array.Empty<bool>();
+        public Vec3[]? ScratchNextVerts;
+        public float[]? ScratchPeakWeights;
     }
 }
